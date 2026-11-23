@@ -1,0 +1,52 @@
+# Game installation, saves, profiles, and user evidence
+profiles/
+**/profiles/
+**/save/
+**/saves/
+**/Saved Games/
+*.sav
+*.sav.*
+*.profile
+*.profile.*
+*.dmp
+*.mdmp
+*.core
+*.log
+*.log.*
+
+# Executables, generated binaries, and unlicensed third-party modules
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.o
+*.lib
+*.a
+*.so
+*.dylib
+*.zip
+
+# Build and temporary output
+/build/
+/dist/
+/out/
+/tmp/
+/temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Editors and OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
