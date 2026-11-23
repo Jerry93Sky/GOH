@@ -42,7 +42,7 @@ class FindInstallationTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             report = json.loads(proc.stdout)
             self.assertEqual(len(report["Installations"]), 1)
-            self.assertEqual(Path(report["Installations"][0]["GamePath"]), game)
+            self.assertTrue(Path(report["Installations"][0]["GamePath"]).samefile(game))
             self.assertTrue(report["Installations"][0]["LocalServerExe"])
             self.assertTrue(report["ReadOnly"])
 

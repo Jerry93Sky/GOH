@@ -119,7 +119,7 @@ class RecoveryCoordinatorTests(unittest.TestCase):
 
         def copy_then_mutate(source, target):
             original_copy(source, target)
-            if Path(source) == self.host / "coop_ckpt.sav":
+            if Path(source).samefile(self.host / "coop_ckpt.sav"):
                 Path(source).write_bytes(b"changed-during-copy")
             return Path(target)
 
