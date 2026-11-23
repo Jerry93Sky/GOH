@@ -30,6 +30,6 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --name GOHRecover
 dist\GOHRecoveryManager.exe --smoke-test
 ```
 
-Workflow [Windows x64](.github/workflows/windows-v0.1.yml) запускает тесты и сборку и публикует ZIP как GitHub Actions artifact. Workflow не устанавливает игру и не выставляет `GAME_VERIFIED`.
+Workflow [Windows x64](.github/workflows/windows-v0.1.yml) запускает тесты и сборку и публикует ZIP как GitHub Actions artifact. [Успешный run #2](https://github.com/Jerry93Sky/GOH/actions/runs/45144792103) создал artifact `GOH-Coop-Recovery-V0.1-Experimental-win64`. Workflow не устанавливает игру и не выставляет `GAME_VERIFIED`.
 
 **Блокер:** отсутствуют реальные двухклиентские TEST-A/TEST-B, точный mapping, корректные runtime metadata для выбранной миссии/build, подтверждение межсессионной загрузки и лицензия для повторной публикации кода Coop Checkpoint. Непроверенные values нельзя вводить по догадке.

@@ -18,7 +18,7 @@
 - Smoke test Python GUI components: PASS. Smoke test Windows EXE следует после сборки.
 - Маркерный формат проверен по release source и симулируется unit tests; это не вызов игрового loader.
 - TEST-A/TEST-B в настоящей игре: **NOT RUN**. GOH не обнаружена; это не `GAME_VERIFIED`.
-- GitHub Actions artifact появляется после успешного workflow run для ветки. До первого успешного опубликованного run прямой URL артефакта неизвестен.
+- GitHub Actions run **#2 успешен** на commit `3143a341c2519bfa829c7e86ac04d89b8c1947a6`: все 12 шагов, включая Windows x64 build, EXE smoke-test, проверку структуры ZIP и upload, завершились `success`. [Run #2 и artifact](https://github.com/Jerry93Sky/GOH/actions/runs/45144792103). Artifact `GOH-Coop-Recovery-V0.1-Experimental-win64` (GitHub artifact id `14803507315`) доступен до 2026-12-23; он содержит ZIP дистрибутива.
 
 ## Ограничения
 
