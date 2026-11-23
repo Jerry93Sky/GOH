@@ -11,14 +11,8 @@ import zipfile
 from pathlib import Path
 
 
-DOCS = (
-    "INSTALL_RU.md", "FIRST_RUN_RU.md", "TEST_A_RU.md", "TEST_B_RU.md",
-    "TROUBLESHOOTING_RU.md", "RECOVERY_METADATA_TEMPLATE_RU.json",
-    "P1_C_RESULTS.md", "OBSERVATION_RU.md", "RECOVERY_WIZARD_RU.md",
-    "DIAGNOSTIC_REPORT_TEMPLATE_RU.json", "P1_C1_FIRST_RUN_RU.md", "P1_C1_RESULTS.md",
-)
 REQUIRED = {
-    "GOHRecoveryManager.exe", "config/default.json", "docs/INSTALL_RU.md",
+    "GOHRecoveryManager.exe", "README.md", "config/default.json", "docs/INSTALL_RU.md",
     "docs/FIRST_RUN_RU.md", "docs/TEST_A_RU.md", "docs/TEST_B_RU.md",
     "docs/TROUBLESHOOTING_RU.md", "docs/RECOVERY_METADATA_TEMPLATE_RU.json",
     "docs/P1_C_RESULTS.md", "docs/OBSERVATION_RU.md", "docs/RECOVERY_WIZARD_RU.md",
@@ -38,11 +32,13 @@ def package(repository: Path, dist: Path) -> Path:
         (stage / "config").mkdir(parents=True)
         (stage / "docs").mkdir()
         shutil.copy2(exe, stage / exe.name)
+        shutil.copy2(repository / "README.md", stage / "README.md")
         shutil.copy2(repository / "config" / "default.json", stage / "config" / "default.json")
-        for name in DOCS:
-            shutil.copy2(repository / "docs" / name, stage / "docs" / name)
+        for document in sorted((repository / "docs").iterdir()):
+            if document.is_file():
+                shutil.copy2(document, stage / "docs" / document.name)
         (stage / "VERSION.txt").write_text(
-            "GOH Coop Recovery V0.2.1 Field-Test\nStatus: EXPERIMENTAL; TEST-A=NOT_RUN; TEST-B=NOT_RUN\nArchitecture: Windows x64\nPython runtime: bundled by PyInstaller one-file executable\nThird-party runtime DLLs are not separately redistributed\n",
+            "GOH Coop Recovery V0.2.1 Field-Test\nAuthor and maintainer: Jerry93Sky (https://github.com/Jerry93Sky)\nStatus: EXPERIMENTAL; TEST-A=NOT_RUN; TEST-B=NOT_RUN\nArchitecture: Windows x64\nPython runtime: bundled by PyInstaller one-file executable\nThird-party runtime DLLs are not separately redistributed\n",
             encoding="utf-8",
         )
         digest = hashlib.sha256((stage / "GOHRecoveryManager.exe").read_bytes()).hexdigest()
@@ -55,7 +51,8 @@ def package(repository: Path, dist: Path) -> Path:
                     archive.write(path, path.relative_to(stage).as_posix())
         with zipfile.ZipFile(temporary_zip) as archive:
             names = set(archive.namelist())
-            missing = REQUIRED - names
+            expected_docs = {f"docs/{document.name}" for document in (repository / "docs").iterdir() if document.is_file()}
+            missing = (REQUIRED | expected_docs) - names
             if missing:
                 raise RuntimeError("Distribution is missing: " + ", ".join(sorted(missing)))
         os.replace(temporary_zip, output)

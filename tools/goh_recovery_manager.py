@@ -25,6 +25,7 @@ from archive_path_resolver import ArchivePathResolver
 import field_test_report as field_reports
 
 APP_VERSION = "0.2.1-field-test"
+APP_AUTHOR = "Jerry93Sky"
 APP_ID = "400750"
 
 
@@ -733,7 +734,7 @@ class Manager(tk.Tk):
     def export_diagnostics(self) -> None:
         store = Path(self.store_dir.get())
         exe = Path(self.game_dir.get()) / "binaries" / "x64" / "call_to_arms.exe"
-        report: dict[str, object] = {"tool": "GOHRecoveryManager", "version": APP_VERSION, "game_dir_set": bool(self.game_dir.get()), "game_file_version": game_file_version(exe) if exe.is_file() else None, "generated_local": datetime.now().astimezone().isoformat(timespec="seconds"), "coop_checkpoint_log_summary": harness.read_coop_diagnostics(tempfile.gettempdir()), "checkpoints": [], "field_test_reports": []}
+        report: dict[str, object] = {"tool": "GOHRecoveryManager", "version": APP_VERSION, "author": APP_AUTHOR, "game_dir_set": bool(self.game_dir.get()), "game_file_version": game_file_version(exe) if exe.is_file() else None, "generated_local": datetime.now().astimezone().isoformat(timespec="seconds"), "coop_checkpoint_log_summary": harness.read_coop_diagnostics(tempfile.gettempdir()), "checkpoints": [], "field_test_reports": []}
         if store.is_dir():
             for d in store.iterdir():
                 if d.is_dir() and (d / "manifest.json").is_file():

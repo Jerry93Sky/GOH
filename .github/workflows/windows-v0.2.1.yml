@@ -2,9 +2,9 @@ name: Windows V0.2.1 Preflight-Hardening Build
 
 on:
   push:
-    branches: [codex/p1-c-1-preflight-hardening]
+    branches: [main, codex/p1-c-1-preflight-hardening]
   pull_request:
-    branches: [codex/p1-c-1-preflight-hardening]
+    branches: [main, codex/p1-c-1-preflight-hardening]
   workflow_dispatch:
 
 permissions:
@@ -26,7 +26,7 @@ jobs:
       - name: Automated synthetic and filesystem tests
         run: python -m unittest discover -s tools/tests -v
       - name: Build standalone GUI executable
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name GOHRecoveryManager --paths tools tools/goh_recovery_manager.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name GOHRecoveryManager --version-file tools/windows_version_info.txt --paths tools tools/goh_recovery_manager.py
       - name: Smoke test packaged executable
         shell: pwsh
         run: |
@@ -39,7 +39,7 @@ jobs:
         run: |
           $zip = [System.IO.Compression.ZipFile]::OpenRead('dist/GOH-Coop-Recovery-V0.2.1-FieldTest-win64.zip')
           try {
-            $required = @('GOHRecoveryManager.exe','config/default.json','docs/INSTALL_RU.md','docs/FIRST_RUN_RU.md','docs/TEST_A_RU.md','docs/TEST_B_RU.md','docs/TROUBLESHOOTING_RU.md','docs/RECOVERY_METADATA_TEMPLATE_RU.json','docs/P1_C_RESULTS.md','docs/OBSERVATION_RU.md','docs/RECOVERY_WIZARD_RU.md','docs/DIAGNOSTIC_REPORT_TEMPLATE_RU.json','docs/P1_C1_FIRST_RUN_RU.md','docs/P1_C1_RESULTS.md','checksums.sha256','VERSION.txt')
+            $required = @('GOHRecoveryManager.exe','README.md','config/default.json','docs/INSTALL_RU.md','docs/FIRST_RUN_RU.md','docs/TEST_A_RU.md','docs/TEST_B_RU.md','docs/INDEX_RU.md','docs/TROUBLESHOOTING_RU.md','docs/RECOVERY_METADATA_TEMPLATE_RU.json','docs/RISKS_AND_LICENSES.md','docs/P1_C_RESULTS.md','docs/OBSERVATION_RU.md','docs/RECOVERY_WIZARD_RU.md','docs/DIAGNOSTIC_REPORT_TEMPLATE_RU.json','docs/P1_C1_FIRST_RUN_RU.md','docs/P1_C1_RESULTS.md','checksums.sha256','VERSION.txt')
             $names = @($zip.Entries | ForEach-Object { $_.FullName })
             foreach ($entry in $required) { if ($entry -notin $names) { throw "Missing archive entry: $entry" } }
           } finally { $zip.Dispose() }
