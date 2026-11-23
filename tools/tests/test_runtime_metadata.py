@@ -170,8 +170,8 @@ reload ARMED: next start of 'campaign/test.mi' loads '@/profiles/765/save/coop_c
         server = self.root / "goh_coop_checkpoint_call_to_arms_server.exe.log"
         client.write_text("client", encoding="utf-8")
         server.write_text("server", encoding="utf-8")
-        self.assertEqual(self.collector.select_role_log([client, server], "client"), client)
-        self.assertEqual(self.collector.select_role_log([client, server], "server"), server)
+        self.assertEqual(self.collector.select_role_log([client, server], "client"), client.resolve())
+        self.assertEqual(self.collector.select_role_log([client, server], "server"), server.resolve())
         with self.assertRaises(ValueError):
             self.collector.select_role_log([client], "server")
         duplicate = self.root / "other" / client.name
