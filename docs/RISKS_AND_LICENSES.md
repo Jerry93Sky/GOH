@@ -33,3 +33,11 @@ V0.1 добавляет только независимо написанные P
 
 Windows file version, найденная под интерфейсом, не считается гарантированным game build. Mod folders могут существовать, но быть выключены. Marker writer использует ввод оператора для exact game-internal paths; даже правильный текстовый формат не подтверждает, что файл доступен целевому процессу/профилю или что scene load пройдёт. Импорт идемпотентен при точном совпадении checksum, блокирует иной файл и может продолжить синтетически прерванный import; это не подтверждает атомарность/надёжность диска или поведение при аварии ОС.
 
+# P1-C third-party review
+
+Research reference: [Coop Checkpoint 1.0.4 published source](https://github.com/nicko996/goh-coop-mods/tree/e7f13b3c2ab9d764a351afca4005ed034c918cca) and [COA Script Extender](https://github.com/NorthHead-Digital/coa_script_extender). The Coop Checkpoint source contract is used only as a documented format reference; this project contains no copied third-party implementation, DLL, proxy, loader, or code signature. Its licensing status was not verified as an explicit grant for redistribution in this research snapshot, so do not package or derive a binary from it.
+
+The COA Script Extender README declares MIT. Its source describes memory hooks and injection pathways; this project does not use its code, binaries, hooks or injection. A permissive license would not establish technical compatibility or multiplayer safety.
+
+The V0.2 portable app is Python/Tkinter packaged with PyInstaller; build dependencies are declared in `requirements-build.txt`. The game, Steam runtime, mods, profile contents and personal data are excluded. Artifact checksums apply to the app executable.
+

@@ -1,0 +1,16 @@
+{
+  "report_schema": "goh-coop-recovery-diagnostic-v1",
+  "synthetic_template": true,
+  "game_test": "NOT_RUN",
+  "tool_version": "0.2.0-field-test",
+  "participants": [],
+  "observations": [],
+  "checkpoint_comparison": {
+    "shared_checkpoint_id": {"value": null, "status": "MISSING", "source_path": null, "observed_at_utc": null, "method": null},
+    "internal_mission_path": {"value": null, "status": "MISSING", "source_path": null, "observed_at_utc": null, "method": null},
+    "game_build": {"value": null, "status": "MISSING", "source_path": null, "observed_at_utc": null, "method": null},
+    "mod_fingerprint": {"value": null, "status": "MISSING", "source_path": null, "observed_at_utc": null, "method": null}
+  },
+  "result": "INCONCLUSIVE",
+  "notes": "Remove personal paths and credentials before sharing. Do not attach full user profiles."
+}

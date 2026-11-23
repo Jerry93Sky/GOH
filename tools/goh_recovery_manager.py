@@ -11,6 +11,8 @@ import sys
 import tempfile
 import traceback
 import zipfile
+import threading
+import queue
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -18,8 +20,11 @@ from tkinter import filedialog, messagebox, ttk
 
 import recovery_coordinator as coordinator
 import recovery_harness as harness
+import runtime_metadata as runtime
+from archive_path_resolver import ArchivePathResolver
+import field_test_report as field_reports
 
-APP_VERSION = "0.1.0-experimental"
+APP_VERSION = "0.2.0-field-test"
 APP_ID = "400750"
 
 
@@ -101,6 +106,10 @@ def smoke_check() -> int:
         marker.write_text("campaign/test.mi\n@/profiles/test/save/coop_ckpt/\nplayers 4 2\n", encoding="utf-8")
         parsed, issues = harness.parse_marker(marker)
         assert not issues and parsed and parsed.players_base == 4 and parsed.players_count == 2
+        metadata = runtime.RuntimeMetadataCollector().parse_log(
+            root / "absent.log")
+        assert metadata["internal_mission_path"].status == runtime.MISSING
+        assert ArchivePathResolver().resolve("@/profiles/test/save/coop_ckpt/", root, "test", "client").status == "UNVERIFIED_PATH"
     print(f"GOHRecoveryManager {APP_VERSION}: smoke check OK")
     return 0
 
@@ -108,12 +117,19 @@ def smoke_check() -> int:
 class Manager(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("GOH Coop Recovery Manager — экспериментальная версия 0.1")
+        self.title("GOH Coop Recovery Manager — V0.2 field test")
         self.geometry("1040x720")
         self.minsize(850, 600)
         self.game_dir = tk.StringVar()
         self.store_dir = tk.StringVar(value=str(default_store()))
         self.checkpoint_dir = tk.StringVar()
+        self.profile_dir = tk.StringVar()
+        self.session_role = tk.StringVar(value="CLIENT")
+        self.observation_status = tk.StringVar(value="Наблюдение выключено")
+        self.collector = runtime.RuntimeMetadataCollector()
+        self._watch_stop = threading.Event()
+        self._watch_thread = None
+        self._watch_queue: queue.Queue = queue.Queue()
         self.status = tk.StringVar(value="Диагностический режим. Игровая совместимость не проверена.")
         self._build_ui()
         self.refresh()
@@ -122,7 +138,7 @@ class Manager(tk.Tk):
         header = ttk.Frame(self, padding=(12, 10))
         header.pack(fill="x")
         ttk.Label(header, text="GOH Coop Recovery", font=("Segoe UI", 18, "bold")).pack(side="left")
-        ttk.Label(header, text="V0.1 • READY FOR GAME TEST • GAME VERIFIED: НЕТ", foreground="#9a5700").pack(side="right")
+        ttk.Label(header, text="V0.2 • ЭКСПЕРИМЕНТ • ИГРОВОЙ ТЕСТ: НЕ ПРОВЕДЁН", foreground="#9a5700").pack(side="right")
         bar = ttk.Frame(self, padding=(12, 0, 12, 8))
         bar.pack(fill="x")
         ttk.Label(bar, text="Папка игры:").grid(row=0, column=0, sticky="w")
@@ -135,18 +151,23 @@ class Manager(tk.Tk):
         tabs = ttk.Notebook(self)
         tabs.pack(fill="both", expand=True, padx=12, pady=6)
         self.connection = ttk.Frame(tabs, padding=12)
+        self.observation = ttk.Frame(tabs, padding=12)
         self.points = ttk.Frame(tabs, padding=12)
         self.recovery = ttk.Frame(tabs, padding=12)
         self.diagnostics = ttk.Frame(tabs, padding=12)
-        tabs.add(self.connection, text="Игра и моды")
+        tabs.add(self.connection, text="Игра")
+        tabs.add(self.observation, text="Наблюдение")
         tabs.add(self.points, text="Контрольные точки")
-        tabs.add(self.recovery, text="Восстановление и пакеты")
+        tabs.add(self.recovery, text="Восстановление")
         tabs.add(self.diagnostics, text="Диагностика")
         self._build_connection()
+        self._build_observation()
         self._build_points()
         self._build_recovery()
         self._build_diagnostics()
         ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w", padding=5).pack(fill="x", side="bottom")
+        self.protocol("WM_DELETE_WINDOW", self._close_manager)
+        self.after(500, self._drain_observation_events)
 
     def _build_connection(self) -> None:
         ttk.Label(self.connection, text="Поиск установки", font=("Segoe UI", 13, "bold")).pack(anchor="w")
@@ -179,6 +200,148 @@ class Manager(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self.select_checkpoint)
         ttk.Label(self.points, text="Полная точка означает только проверенную файловую структуру. Игровая загрузка считается подтверждённой только с приложенным протоколом реального теста.", wraplength=900).pack(anchor="w")
 
+    def _build_observation(self) -> None:
+        ttk.Label(self.observation, text="Локальный сбор метаданных", font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        ttk.Label(self.observation, text="Выберите папку одного профиля. Сканируются только его save\\coop_ckpt*.sav и точные диагностические логи Coop Checkpoint в TEMP. Синтетические сведения не используются.", wraplength=930).pack(anchor="w", pady=5)
+        row = ttk.Frame(self.observation); row.pack(fill="x", pady=5)
+        ttk.Entry(row, textvariable=self.profile_dir).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Выбрать профиль…", command=self.choose_profile).pack(side="left", padx=5)
+        role_row = ttk.Frame(self.observation); role_row.pack(anchor="w", pady=5)
+        ttk.Label(role_row, text="Роль этого компьютера:").pack(side="left")
+        ttk.Combobox(role_row, textvariable=self.session_role, values=("HOST", "CLIENT"), state="readonly", width=12).pack(side="left", padx=6)
+        buttons = ttk.Frame(self.observation); buttons.pack(anchor="w", pady=5)
+        ttk.Button(buttons, text="Наблюдать за сохранениями", command=self.start_observation).pack(side="left")
+        ttk.Button(buttons, text="Остановить наблюдение", command=self.stop_observation).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Собрать доступные метаданные", command=self.collect_now).pack(side="left")
+        ttk.Label(self.observation, textvariable=self.observation_status, foreground="#245b31").pack(anchor="w", pady=4)
+        self.observation_text = tk.Text(self.observation, wrap="word")
+        self.observation_text.pack(fill="both", expand=True, pady=6)
+        self._text(self.observation_text, "Каждое поле сопровождается источником и методом. Стабильность файла не доказывает завершение синхронной записи на всех компьютерах. Роль HOST/CLIENT задаётся оператором и не выводится из имени процесса.\n")
+
+    def choose_profile(self) -> None:
+        path = filedialog.askdirectory(title="Выберите корень профиля (содержит save)")
+        if path:
+            self.profile_dir.set(path)
+
+    def _observation_files(self) -> list[Path]:
+        profile = Path(self.profile_dir.get()).expanduser()
+        return [p.resolve() for p in (profile / "save" / "coop_ckpt.sav", profile / "save" / "coop_ckpt_srv.sav") if p.is_file()]
+
+    def _metadata_context(self, log_path: Path | None, profile_root: Path, game_root: Path) -> dict:
+        fields = self.collector.parse_log(log_path) if log_path else {}
+        fields["profile_root"] = runtime.FieldValue(str(profile_root.resolve()), runtime.OPERATOR_PROVIDED,
+            None, runtime.utc_now(), "user selected profile directory")
+        exe = game_root / "binaries/x64/call_to_arms.exe"
+        version = game_file_version(exe) if exe.is_file() else None
+        fields["game_exe_file_version"] = runtime.FieldValue(version, runtime.OBSERVED if version else runtime.MISSING,
+            str(exe) if exe.is_file() else None, runtime.utc_now(), "Windows PE version resource; not the confirmed in-game build")
+        inventory = self.collector.inspect_installation(game_root) if game_root.is_dir() else []
+        hashes = {r["component"]: r["sha256"] for r in inventory if r.get("sha256")}
+        fields["known_mod_file_hashes"] = runtime.FieldValue(hashes or None,
+            runtime.OBSERVED if hashes else runtime.MISSING, str(game_root), runtime.utc_now(),
+            "SHA-256 of discovered known loader/mod files; activation and mod list not inferred")
+        return fields
+
+    def _append_observation(self, value: str) -> None:
+        self.observation_text.configure(state="normal")
+        self.observation_text.insert("end", value + "\n")
+        self.observation_text.see("end")
+        self.observation_text.configure(state="disabled")
+
+    def collect_now(self) -> None:
+        profile = Path(self.profile_dir.get()).expanduser()
+        if not profile.is_dir():
+            messagebox.showwarning("Наблюдение", "Сначала выберите существующую папку профиля.")
+            return
+        logs = sorted(Path(tempfile.gettempdir()).glob("goh_coop_checkpoint_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
+        selected_game = Path(self.game_dir.get()).expanduser() if self.game_dir.get() else Path("__no_game_selected__")
+        fields = self._metadata_context(logs[0] if logs else None, profile, selected_game)
+        files = self._observation_files()
+        if not files:
+            self._append_observation("Сохранения coop_ckpt.sav / coop_ckpt_srv.sav не найдены в выбранном profile\\save.")
+        for source in files:
+            role = "server" if source.name.casefold() == "coop_ckpt_srv.sav" else "client"
+            try:
+                snap = self.collector.observe_save(source, role, Path(self.store_dir.get()) / "observed-local", fields, stable_interval=2.0, stable_samples=2)
+                record = snap.to_dict()
+                record["session_role"] = {"value": self.session_role.get(), "status": runtime.OPERATOR_PROVIDED,
+                    "source_path": None, "observed_at_utc": runtime.utc_now(), "method": "GUI operator selection"}
+                out = Path(self.store_dir.get()) / "observed-local" / (Path(snap.copy_path).parent.name + ".json")
+                out.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                self._append_observation(f"Локальная копия проверена: {source.name}; {snap.size_bytes} байт; SHA-256 {snap.sha256}; {snap.engine_write_confirmation}.\n" + ", ".join(f"{k}={v.value!r} [{v.status}]" for k, v in snap.metadata.items()))
+            except Exception as exc:
+                self._append_observation(f"Наблюдение остановлено для {source.name}: {exc}")
+
+    def start_observation(self) -> None:
+        if self._watch_thread and self._watch_thread.is_alive():
+            return
+        profile = Path(self.profile_dir.get()).expanduser()
+        if not profile.is_dir():
+            messagebox.showwarning("Наблюдение", "Выберите корень профиля до запуска наблюдения.")
+            return
+        watch_files = [profile / "save" / n for n in ("coop_ckpt.sav", "coop_ckpt_srv.sav")]
+        watch_files += list(Path(tempfile.gettempdir()).glob("goh_coop_checkpoint_*.log"))
+        watch_files = [p for p in watch_files if p.parent.is_dir()]
+        if not watch_files:
+            messagebox.showinfo("Наблюдение", "Каталог профиля недоступен.")
+            return
+        self._watch_stop.clear()
+        store_root = Path(self.store_dir.get()) / "observed-local"
+        operator_role = self.session_role.get()
+        selected_profile = profile.resolve()
+        selected_game = Path(self.game_dir.get()).expanduser() if self.game_dir.get() else Path("__no_game_selected__")
+        def changed(path, signature):
+            self._watch_queue.put((path, signature))
+        def worker():
+            self.collector.watch(watch_files, changed, self._watch_stop, interval=3.0)
+        self._watch_thread = threading.Thread(target=worker, name="GOH-readonly-observer", daemon=True)
+        self._watch_thread.start()
+        self.observation_status.set(f"Наблюдение включено: {len(watch_files)} точных файлов/путей, опрос 3 с. Новые лог-файлы TEMP требуют перезапуска наблюдения.")
+
+    def _drain_observation_events(self) -> None:
+        while True:
+            try:
+                path, signature = self._watch_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._append_observation(f"Изменение обнаружено: {path.name}; size={signature[0]}. Ожидается локальная стабилизация; это не подтверждение завершения движком.")
+            if path.name.casefold() in {"coop_ckpt.sav", "coop_ckpt_srv.sav"}:
+                role = "server" if path.name.casefold().endswith("_srv.sav") else "client"
+                def snapshot_worker(source=path, archive_role=role, out_root=store_root, selected_role=operator_role,
+                                    profile_root=selected_profile, game_root=selected_game):
+                    try:
+                        log_candidates = sorted(Path(tempfile.gettempdir()).glob("goh_coop_checkpoint_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
+                        metadata = self._metadata_context(log_candidates[0] if log_candidates else None, profile_root, game_root)
+                        snap = self.collector.observe_save(source, archive_role,
+                            out_root, metadata, stable_interval=2, stable_samples=3, cancel=self._watch_stop)
+                        record = snap.to_dict()
+                        record["session_role"] = {"value": selected_role, "status": runtime.OPERATOR_PROVIDED,
+                            "source_path": None, "observed_at_utc": runtime.utc_now(), "method": "GUI operator selection"}
+                        self._watch_queue.put(("snapshot", (snap, record)))
+                    except Exception as exc:
+                        self._watch_queue.put(("error", (source.name, str(exc))))
+                threading.Thread(target=snapshot_worker, name="GOH-save-copy", daemon=True).start()
+            elif path.name == "snapshot":
+                snap, record = signature
+                self._append_observation(f"Снимок сохранён отдельно и проверен: {snap.copy_path}; SHA-256={snap.sha256}; {snap.engine_write_confirmation}")
+                try:
+                    output = Path(snap.copy_path).parent / "observation.json"
+                    output.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                except OSError as exc:
+                    self._append_observation(f"Метаданные snapshot не сохранены: {exc}")
+            elif path.name == "error":
+                self._append_observation(f"Снимок не создан: {signature[0]}: {signature[1]}")
+        if self.winfo_exists():
+            self.after(500, self._drain_observation_events)
+
+    def stop_observation(self) -> None:
+        self._watch_stop.set()
+        self.observation_status.set("Запрошено безопасное завершение наблюдения.")
+
+    def _close_manager(self) -> None:
+        self._watch_stop.set()
+        self.destroy()
+
     def _build_recovery(self) -> None:
         ttk.Label(self.recovery, text="Экспорт / импорт пакета участника", font=("Segoe UI", 13, "bold")).pack(anchor="w")
         row = ttk.Frame(self.recovery)
@@ -188,14 +351,15 @@ class Manager(tk.Tk):
         ttk.Button(row, text="Выбрать…", command=self.choose_checkpoint).pack(side="left")
         ttk.Button(self.recovery, text="Экспорт пакета участника…", command=self.export_package).pack(anchor="w", pady=4)
         ttk.Button(self.recovery, text="Импорт и проверка пакета…", command=self.import_package).pack(anchor="w", pady=4)
+        ttk.Button(self.recovery, text="Сверить пакеты всех участников…", command=self.validate_peer_group_dialog).pack(anchor="w", pady=4)
         ttk.Separator(self.recovery).pack(fill="x", pady=12)
         ttk.Label(self.recovery, text="Режим A — проверить существующие маркеры", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         marker_row = ttk.Frame(self.recovery)
         marker_row.pack(anchor="w", pady=6)
         ttk.Button(marker_row, text="Проверить локальные TEMP-маркеры", command=self.inspect_markers).pack(side="left")
         ttk.Button(marker_row, text="Сохранить копию существующих marker", command=self.backup_markers).pack(side="left", padx=8)
-        ttk.Label(self.recovery, text="Режим B — подготовить маркер из явных метаданных", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(8, 0))
-        ttk.Label(self.recovery, text="Требуется JSON с точными internal_mission_path и archive_path (виртуальный base path из runtime лога, обычно с завершающим /; не Windows путь к .sav), player_id, player_mapping {base,count}, game_build, mission_id и mod_fingerprint. Для server role укажите is_host=true. Это экспериментальная подготовка файлов; она не подтверждает загрузку движком.", wraplength=930).pack(anchor="w", pady=5)
+        ttk.Label(self.recovery, text="Локальная подготовка для HOST/CLIENT", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(8, 0))
+        ttk.Label(self.recovery, text="HOST требует локальные client и server архивы; для них готовятся отдельные marker. CLIENT требует собственный client архив. Mission path, virtual archive path и player mapping берутся из авторского лога, если доступны; отсутствующие точные значения запрашиваются отдельно. Участники подтверждают готовность вручную.", wraplength=930).pack(anchor="w", pady=5)
         ttk.Button(self.recovery, text="Подготовить локальный marker…", command=self.prepare_marker).pack(anchor="w", pady=5)
         ttk.Label(self.recovery, text="Подготовка запускает 15-минутный TTL. Кнопка требует явного подтверждения готовности всех участников и не перезаписывает существующий marker. Без точного player mapping подготовка запрещена.", foreground="#8a4200", wraplength=900).pack(anchor="w")
 
@@ -204,6 +368,7 @@ class Manager(tk.Tk):
         row.pack(fill="x")
         ttk.Button(row, text="Собрать очищенный отчёт…", command=self.export_diagnostics).pack(side="left")
         ttk.Button(row, text="Проверить выбранный recovery пакет…", command=self.validate_package_dialog).pack(side="left", padx=8)
+        ttk.Button(row, text="Записать результат TEST-A/B…", command=self.record_field_outcome).pack(side="left", padx=8)
         ttk.Button(row, text="Прочитать Coop Checkpoint log", command=self.show_coop_logs).pack(side="left")
         self.diag_text = tk.Text(self.diagnostics, wrap="word")
         self.diag_text.pack(fill="both", expand=True, pady=8)
@@ -239,9 +404,12 @@ class Manager(tk.Tk):
         p = Path(self.game_dir.get())
         items = []
         if p.is_dir():
-            for name in ("binaries/x64/call_to_arms.exe", "binaries/x64/call_to_arms_server.exe", "version.dll", "binaries/x64/goh_mods/coop_checkpoint.dll", "mods/coop_checkpoint"):
-                f = p / name
-                items.append(f"{'НАЙДЕН' if f.exists() else 'нет'}: {f}")
+            for record in self.collector.inspect_installation(p):
+                items.append(f"{record['file_status']}: {record['component']}: {record['path']}")
+                if record["loader_status"] == "LOADER_IDENTIFIED":
+                    items.append("  LOADER_IDENTIFIED по опубликованному имени; RUNTIME_UNVERIFIED")
+                if record.get("sha256"):
+                    items.append(f"  SHA-256: {record['sha256']}")
             exe = p / "binaries" / "x64" / "call_to_arms.exe"
             version = game_file_version(exe) if exe.is_file() else None
             self.game_info.configure(state="normal")
@@ -258,7 +426,7 @@ class Manager(tk.Tk):
             items.append("Папка игры не задана или отсутствует.")
         self.mods_info.configure(state="normal")
         self.mods_info.delete("1.0", "end")
-        self.mods_info.insert("end", "\n".join(items) + "\n\nКаталог мода не подтверждает, что он включён в профиле или одинаков у всех участников.\nCoop Checkpoint: найденные файлы не подтверждают правильную загрузку или совместимость.\n")
+        self.mods_info.insert("end", "\n".join(items) + "\n\nFILE_FOUND = найден только файл. LOADER_IDENTIFIED = найден файл с известным именем, но запуск не подтверждён. RUNTIME_UNVERIFIED = совместимость/фактическая загрузка неизвестна.\nКаталог мода не подтверждает, что он включён в профиле или одинаков у всех участников. Наличие version.dll само по себе не идентифицирует её содержимое.\n")
         self.mods_info.configure(state="disabled")
 
     def refresh(self) -> None:
@@ -384,6 +552,16 @@ class Manager(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Ошибка импорта", str(exc))
 
+    def validate_peer_group_dialog(self) -> None:
+        packages = filedialog.askopenfilenames(title="Выберите ZIP каждого участника", filetypes=[("ZIP", "*.zip")])
+        if not packages:
+            return
+        host = self.ask_value("HOST participant ID", "Введите player ID компьютера-хоста:")
+        if not host:
+            return
+        result = harness.validate_peer_group(list(packages), host)
+        messagebox.showinfo("Проверка набора файлов", json.dumps(result, ensure_ascii=False, indent=2))
+
     def inspect_markers(self) -> None:
         temp = Path(tempfile.gettempdir())
         lines = []
@@ -423,21 +601,53 @@ class Manager(tk.Tk):
         if not checkpoint.is_dir():
             messagebox.showwarning("Marker", "Выберите checkpoint.")
             return
-        metadata_path = filedialog.askopenfilename(title="Recovery metadata JSON", filetypes=[("JSON", "*.json")])
-        if not metadata_path:
-            return
         try:
-            metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-            role = metadata.get("role")
-            archive = filedialog.askopenfilename(title="Выберите локальную клиентскую или серверную копию", filetypes=[("GOH save", "*.sav")])
-            if not archive:
+            manifest, issues = harness.read_checkpoint(checkpoint)
+            if issues:
+                raise harness.HarnessError("Checkpoint package is incomplete: " + "; ".join(issues))
+            if self.session_role.get() == "HOST":
+                role = "server" if messagebox.askyesno("HOST marker", "Подготовить SERVER marker? Выберите Нет для CLIENT marker хоста.") else "client"
+            else:
+                role = "client"
+            player = self.ask_value("Участник", "Выберите точный participant ID из roster: " + ", ".join(manifest.get("expected_players", [])))
+            if not player:
                 return
-            marker_dir = filedialog.askdirectory(title="Каталог TEMP для тестового marker (в рабочей игре оставьте %TEMP%)")
-            if not marker_dir:
+            profile = Path(self.profile_dir.get()).expanduser().resolve()
+            if not profile.is_dir():
+                raise harness.HarnessError("Выберите точный локальный профиль на вкладке Наблюдение")
+            profile_id = profile.name
+            if not messagebox.askyesno("Профиль", f"Использовать ID профиля '{profile_id}' из выбранной папки? Проверяется точный файл save\\coop_ckpt*.sav."):
                 return
-            if Path(marker_dir).resolve() != Path(tempfile.gettempdir()).resolve() and not messagebox.askyesno("Путь marker", "Указан нестандартный каталог. Загрузчик штатно смотрит Windows TEMP. Продолжить для изолированного теста?"):
+            logs = sorted(Path(tempfile.gettempdir()).glob("goh_coop_checkpoint_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
+            observed = self.collector.parse_log(logs[0]) if logs else {}
+            def known_or_ask(key: str, prompt: str):
+                value = observed.get(key)
+                if value and value.status == runtime.OBSERVED and value.value not in (None, ""):
+                    return value.value
+                return self.ask_value("Требуется точное значение", prompt)
+            mission_path = known_or_ask("internal_mission_path", "Точный internal mission path из Coop Checkpoint log:")
+            archive_path = known_or_ask("virtual_archive_base_path", "Точный virtual archive base path из строки reload ARMED:")
+            mapping = known_or_ask("player_mapping", "Точный player mapping из Coop Checkpoint log отсутствует. Введите base,count (например 4,2):")
+            if isinstance(mapping, str):
+                try:
+                    base, count = (int(piece.strip()) for piece in mapping.split(",", 1))
+                    mapping = {"base": base, "count": count}
+                except (ValueError, TypeError):
+                    raise harness.HarnessError("Player mapping должен быть base,count числами из лога")
+            if not mission_path or not archive_path or not mapping:
                 return
-            path = harness.prepare_marker(checkpoint, metadata, role, archive, marker_dir, True)
+            metadata = {"checkpoint_id": manifest.get("checkpoint_id"), "internal_mission_path": mission_path,
+                "archive_path": archive_path, "player_id": player, "game_build": manifest.get("game_build"),
+                "mission_id": manifest.get("mission_id"), "mod_fingerprint": manifest.get("mod_fingerprint"),
+                "is_host": self.session_role.get() == "HOST", "role": role, "player_mapping": mapping,
+                "profile_root": str(profile), "profile_id": profile_id}
+            resolution = ArchivePathResolver().resolve(archive_path, profile, profile_id, role)
+            if resolution.status != "RESOLVED_LOCAL_FILE":
+                raise harness.HarnessError("UNVERIFIED_PATH: " + resolution.reason)
+            marker_dir = Path(tempfile.gettempdir())
+            if not messagebox.askyesno("TEMP marker", f"Будет создан одноразовый marker в стандартном TEMP:\n{marker_dir}\n\nTTL загрузчика — 15 минут. Продолжить?"):
+                return
+            path = harness.prepare_marker(checkpoint, metadata, role, resolution.local_file, marker_dir, True)
             messagebox.showwarning("Marker подготовлен — эксперимент", f"Файл записан:\n{path}\n\nЭто не подтверждает работу в игре. Сверьте полный путь, тип процесса, архив и оставшееся время TTL. Резервная копия автоматизирована только для уже существующего marker (здесь перезапись запрещена).")
         except Exception as exc:
             messagebox.showerror("Подготовка остановлена", str(exc))
@@ -445,7 +655,7 @@ class Manager(tk.Tk):
     def export_diagnostics(self) -> None:
         store = Path(self.store_dir.get())
         exe = Path(self.game_dir.get()) / "binaries" / "x64" / "call_to_arms.exe"
-        report: dict[str, object] = {"tool": "GOHRecoveryManager", "version": APP_VERSION, "game_dir_set": bool(self.game_dir.get()), "game_file_version": game_file_version(exe) if exe.is_file() else None, "generated_local": datetime.now().astimezone().isoformat(timespec="seconds"), "coop_checkpoint_log_summary": harness.read_coop_diagnostics(tempfile.gettempdir()), "checkpoints": []}
+        report: dict[str, object] = {"tool": "GOHRecoveryManager", "version": APP_VERSION, "game_dir_set": bool(self.game_dir.get()), "game_file_version": game_file_version(exe) if exe.is_file() else None, "generated_local": datetime.now().astimezone().isoformat(timespec="seconds"), "coop_checkpoint_log_summary": harness.read_coop_diagnostics(tempfile.gettempdir()), "checkpoints": [], "field_test_reports": []}
         if store.is_dir():
             for d in store.iterdir():
                 if d.is_dir() and (d / "manifest.json").is_file():
@@ -454,6 +664,15 @@ class Manager(tk.Tk):
                         report["checkpoints"].append({"checkpoint_id": m.get("checkpoint_id"), "status": m.get("status"), "mission_id": m.get("mission_id"), "game_build": m.get("game_build"), "mod_fingerprint": m.get("mod_fingerprint"), "files": [{"owner": f.get("owner"), "path": Path(f.get("path", "")).name, "size_bytes": f.get("size_bytes"), "sha256": f.get("sha256")} for f in m.get("files", [])], "integrity_issues": issues})
                     except Exception as exc:
                         report["checkpoints"].append({"directory_name": d.name, "error": str(exc)})
+            field_report_root = store / "results" / "field-test-reports"
+            if field_report_root.is_dir():
+                for result_path in sorted(field_report_root.glob("*.json")):
+                    try:
+                        value = json.loads(result_path.read_text(encoding="utf-8"))
+                        report["field_test_reports"].append({k: value.get(k) for k in
+                            ("report_id", "checkpoint_id", "test_id", "operator_reported_outcome", "confirmed_real_game", "evidence_file_names", "recorded_at_utc", "restore_verified_status")})
+                    except (OSError, json.JSONDecodeError):
+                        report["field_test_reports"].append({"status": "UNREADABLE_REPORT", "file": result_path.name})
         destination = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")], initialfile="GOH-recovery-diagnostics.json")
         if destination:
             Path(destination).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -468,6 +687,36 @@ class Manager(tk.Tk):
             messagebox.showinfo("Проверка пакета", json.dumps({"metadata": meta, "issues": issues}, ensure_ascii=False, indent=2))
         except Exception as exc:
             messagebox.showerror("Ошибка пакета", str(exc))
+
+    def record_field_outcome(self) -> None:
+        checkpoint = self.selected_dir()
+        if not checkpoint:
+            messagebox.showwarning("Результат теста", "Сначала выберите checkpoint в соответствующей вкладке.")
+            return
+        test_id = self.ask_value("Испытание", "Введите TEST-A или TEST-B:").strip().upper()
+        outcome = self.ask_value("Результат", "Введите PASS, FAIL или INCONCLUSIVE:").strip().upper()
+        if test_id not in {"TEST-A", "TEST-B"} or outcome not in {"PASS", "FAIL", "INCONCLUSIVE"}:
+            messagebox.showwarning("Результат теста", "Допустимы TEST-A/TEST-B и PASS/FAIL/INCONCLUSIVE.")
+            return
+        evidence = []
+        confirmed = False
+        if outcome in {"PASS", "FAIL"}:
+            confirmed = messagebox.askyesno("Реальный игровой прогон", "Вы лично провели выбранное испытание в реальной игре со всеми участниками?")
+            if not confirmed:
+                messagebox.showwarning("Результат теста", "PASS/FAIL не записан без подтверждения игрового прогона.")
+                return
+            evidence = filedialog.askopenfilenames(title="Выберите игровые логи/свидетельства", filetypes=[("Evidence", "*.log *.txt *.json *.png *.jpg *.jpeg *.mp4"), ("All files", "*.*")])
+            if not evidence:
+                messagebox.showwarning("Результат теста", "Для PASS/FAIL требуется хотя бы один файл evidence.")
+                return
+        notes = self.ask_value("Примечание", "Краткое примечание (необязательно):")
+        try:
+            report = field_reports.record_field_outcome(Path(self.store_dir.get()), checkpoint.name,
+                test_id, outcome, list(evidence), confirmed, notes)
+            messagebox.showinfo("Результат сохранён", f"Локальная запись создана:\n{report}\n\nОна не устанавливает RESTORE_VERIFIED автоматически.")
+            self.status.set(f"{test_id}: {outcome} сохранён как операторский отчёт; статус восстановления не менялся")
+        except Exception as exc:
+            messagebox.showerror("Ошибка результата", str(exc))
 
 
 def main(argv: list[str] | None = None) -> int:

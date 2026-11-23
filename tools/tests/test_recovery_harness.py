@@ -69,6 +69,45 @@ class RecoveryHarnessTests(unittest.TestCase):
             self.assertFalse(issues)
             self.assertEqual(set(meta["expected_players"]), {"host", "p2", "p3"})
 
+    def test_peer_group_compares_roster_and_requires_host_server(self):
+        self.capture()
+        packages=[]
+        for player in ("host", "guest"):
+            package=self.root / f"group-{player}.zip"
+            rh.build_peer_package(self.store / "cp-test", player, package, include_host_server=player == "host")
+            packages.append(package)
+        result=rh.validate_peer_group(packages, "host")
+        self.assertEqual(result["status"], "GROUP_FILE_SET_VERIFIED")
+        self.assertEqual(result["game_restore_status"], "NOT_VERIFIED_BY_FILE_SET")
+
+    def test_peer_group_rejects_missing_host_server_archive(self):
+        self.capture()
+        packages=[]
+        for player in ("host", "guest"):
+            package=self.root / f"no-server-{player}.zip"
+            rh.build_peer_package(self.store / "cp-test", player, package, include_host_server=False)
+            packages.append(package)
+        result=rh.validate_peer_group(packages, "host")
+        self.assertEqual(result["status"], "INCOMPLETE_OR_MISMATCHED")
+        self.assertIn("host package is missing its local server archive", result["issues"])
+
+    def test_peer_group_rejects_cross_package_metadata_mismatch(self):
+        self.capture()
+        a=self.root / "group-host.zip"; b=self.root / "group-guest.zip"
+        rh.build_peer_package(self.store / "cp-test", "host", a, include_host_server=True)
+        rh.build_peer_package(self.store / "cp-test", "guest", b)
+        rewritten=self.root / "group-guest-rewritten.zip"
+        with zipfile.ZipFile(b) as source, zipfile.ZipFile(rewritten,"w") as target:
+            import json
+            for name in source.namelist():
+                payload=source.read(name)
+                if name == "package.json":
+                    metadata=json.loads(payload); metadata["game_build"]="different-build"
+                    payload=json.dumps(metadata).encode()
+                target.writestr(name,payload)
+        result=rh.validate_peer_group([a, rewritten], "host")
+        self.assertTrue(any("game_build mismatch" in issue for issue in result["issues"]))
+
     def test_missing_client_archive_blocks_export(self):
         self.capture(missing_client="guest")
         with self.assertRaises(rh.HarnessError):
@@ -146,9 +185,11 @@ class RecoveryHarnessTests(unittest.TestCase):
         self.capture()
         local = self.root / "local"
         self.write(local / "coop_ckpt.sav", b"client-guest")
+        profile = self.root / "profile"
+        self.write(profile / "save" / "coop_ckpt.sav", b"client-guest")
         meta = {"checkpoint_id": "cp-test", "internal_mission_path": "campaign/x.mi", "archive_path": "@/profiles/guest/save/coop_ckpt/", "player_id": "guest",
                 "game_build": "1.069.0", "mission_id": "mission-x", "mod_fingerprint": "mods-sha",
-                "is_host": False, "role": "client", "player_mapping": {"base": 4, "count": 2}}
+                "is_host": False, "role": "client", "player_mapping": {"base": 4, "count": 2}, "profile_root": str(profile), "profile_id": "guest"}
         path = rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", self.root / "temp", True)
         marker, issues = rh.parse_marker(path)
         self.assertFalse(issues)

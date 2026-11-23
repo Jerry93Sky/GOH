@@ -29,3 +29,8 @@ quant checkpoint intent
 - P1 — проверка форматов/совместимости снимков и проектирование manifest/ACK на внешнем harness.
 - P2+ — только после P1 и явного решения команды о live-game adapter.
 - Live join в выполняющуюся миссию — отдельный исследовательский трек.
+# P1-C V0.2 notes
+
+Read-only `RuntimeMetadataCollector` records every parsed value with status, source file, UTC observation time and extraction method. `ArchivePathResolver` accepts only the source-documented archive stems under the explicitly selected profile ID; it never searches for a similarly named save. Watcher polling is limited to exact selected profile checkpoint paths and currently existing Coop Checkpoint logs. File copies go to an isolated observation store; hashes are compared to the source before publishing the observation. Stable file metadata is not an engine/network acknowledgement.
+
+`HOST`/`CLIENT` is an operator selection. The observer does not infer network role from a process name. Local process checkpoint sequence is not shared checkpoint identity. No observation package automatically becomes a complete cross-peer checkpoint; current peer ZIP export still requires a verified coordinator manifest.

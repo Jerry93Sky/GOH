@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import recovery_coordinator as coordinator
+from archive_path_resolver import ArchivePathResolver
 
 MARKER_TTL_SECONDS = 15 * 60
 CLIENT_MARKER = "coop_checkpoint_reload_client.txt"
@@ -153,6 +154,51 @@ def inspect_peer_package(package: str | Path) -> tuple[dict[str, Any], list[str]
             if not isinstance(meta.get(field), str) or not meta[field].strip():
                 issues.append(f"missing package metadata: {field}")
         return meta, issues
+
+
+def validate_peer_group(packages: list[str | Path], host_player_id: str) -> dict[str, Any]:
+    """Check separate participant ZIPs agree as a file set; this does not prove game synchronization."""
+    issues: list[str] = []
+    if len(packages) < 2:
+        issues.append("at least two participant packages are required")
+    records = []
+    for package in packages:
+        try:
+            metadata, package_issues = inspect_peer_package(package)
+            issues.extend(f"{Path(package).name}: {issue}" for issue in package_issues)
+            records.append(metadata)
+        except Exception as exc:
+            issues.append(f"{Path(package).name}: {exc}")
+    if not records:
+        return {"status": "INCOMPLETE", "issues": issues, "participants": []}
+    fields = ("checkpoint_id", "mission_id", "game_build", "mod_fingerprint")
+    reference = records[0]
+    for record in records[1:]:
+        for field in fields:
+            if record.get(field) != reference.get(field):
+                issues.append(f"{field} mismatch across participant packages")
+        if set(record.get("expected_players", [])) != set(reference.get("expected_players", [])):
+            issues.append("participant roster mismatch across packages")
+    ids = [record.get("participant_id") for record in records]
+    if len(ids) != len(set(ids)):
+        issues.append("duplicate participant package")
+    roster = set(reference.get("expected_players", []))
+    if set(ids) != roster:
+        issues.append("package participant set does not exactly match expected roster")
+    hosts = [r for r in records if r.get("participant_id") == host_player_id]
+    if len(hosts) != 1:
+        issues.append("host participant package is missing or ambiguous")
+    elif not hosts[0].get("includes_host_server"):
+        issues.append("host package is missing its local server archive")
+    for record in records:
+        if record.get("participant_id") != host_player_id and record.get("includes_host_server"):
+            issues.append(f"server archive is present in non-host package {record.get('participant_id')}")
+    return {"status": "GROUP_FILE_SET_VERIFIED" if not issues else "INCOMPLETE_OR_MISMATCHED",
+            "checkpoint_id": reference.get("checkpoint_id"), "mission_id": reference.get("mission_id"),
+            "game_build": reference.get("game_build"), "mod_fingerprint": reference.get("mod_fingerprint"),
+            "expected_players": reference.get("expected_players"), "participants": ids,
+            "host_player_id": host_player_id, "issues": issues,
+            "game_restore_status": "NOT_VERIFIED_BY_FILE_SET"}
 
 
 def import_peer_package(package: str | Path, target_dir: str | Path,
@@ -299,6 +345,15 @@ def prepare_marker(checkpoint_dir: str | Path, package_metadata: dict[str, Any],
     archive_path = package_metadata["archive_path"]
     if not isinstance(archive_path, str) or not archive_path.endswith("/") or archive_path.casefold().endswith(".sav/"):
         raise HarnessError("archive_path must be the exact loader archive base path ending in '/', not a Windows .sav filename")
+    profile_root = package_metadata.get("profile_root")
+    profile_id = package_metadata.get("profile_id")
+    if not profile_root or not profile_id:
+        raise HarnessError("Exact local profile_root and profile_id are required to resolve the virtual archive path")
+    resolution = ArchivePathResolver().resolve(archive_path, profile_root, str(profile_id), role)
+    if resolution.status != "RESOLVED_LOCAL_FILE" or resolution.local_file is None:
+        raise HarnessError("UNVERIFIED_PATH: " + resolution.reason)
+    if resolution.local_file.stat().st_size != archive.stat().st_size or _digest(resolution.local_file) != _digest(archive):
+        raise HarnessError("Resolved profile archive differs from the selected checkpoint archive")
     path = Path(marker_dir).resolve() / (SERVER_MARKER if role == "server" else CLIENT_MARKER)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():

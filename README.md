@@ -1,5 +1,9 @@
 # GOH Coop Recovery
 
+Независимый экспериментальный Windows-инструмент для read-only наблюдения и подготовки файловых recovery экспериментов Call to Arms – Gates of Hell: Ostfront. Текущая ветка P1-C/V0.2 НЕ подтверждена реальной игрой; TEST-A и TEST-B должны оставаться NOT_RUN до соответствующих игровых прогонов.
+
+V0.2 включает GUI на русском языке, выбор HOST/CLIENT, локальное наблюдение за известными Coop Checkpoint файлами, provenance метаданных, консервативный resolver virtual archive path, SHA-256 проверки, ручной обмен participant ZIP из полного checkpoint manifest, проверку набора peer ZIP и локальную запись отчёта TEST-A/B. Автоматического сетевого взаимодействия, runtime hooks и Hot Rejoin нет. Смотрите [результаты P1-C](docs/P1_C_RESULTS.md), [руководство наблюдения](docs/OBSERVATION_RU.md), [Recovery порядок](docs/RECOVERY_WIZARD_RU.md), [TEST-A](docs/TEST_A_RU.md) и [TEST-B](docs/TEST_B_RU.md).
+
 Независимый экспериментальный проект для исследования восстановления исторических кооперативных миссий Call to Arms – Gates of Hell: Ostfront (Windows x64). Текущая ветка `codex/p1-b-experimental-build` добавляет P1-B офлайн Recovery Manager поверх P0–P1-A.
 
 ## Статус
