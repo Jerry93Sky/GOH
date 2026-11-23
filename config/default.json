@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "checkpoint_store": "%LOCALAPPDATA%/GOH Coop Recovery/checkpoints",
+  "marker_ttl_seconds": 900,
+  "game_integration_enabled": false,
+  "game_build_status": "UNKNOWN",
+  "coop_checkpoint_release": "coop-checkpoint-v1.0.4",
+  "never_replace_version_dll": true
+}

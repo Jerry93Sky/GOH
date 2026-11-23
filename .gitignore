@@ -27,6 +27,7 @@ checkpoint-store/
 *.pdb
 *.ilk
 *.obj
+GOHRecoveryManager.spec
 *.o
 *.lib
 *.a

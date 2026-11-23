@@ -1,0 +1,15 @@
+{
+  "checkpoint_id": "REPLACE_WITH_EXACT_CHECKPOINT_ID",
+  "internal_mission_path": "REPLACE_WITH_EXACT_RUNTIME_MISSION_PATH",
+  "archive_path": "REPLACE_WITH_EXACT_RUNTIME_ARCHIVE_BASE/",
+  "player_id": "REPLACE_WITH_CHECKPOINT_ROSTER_ID",
+  "role": "client",
+  "is_host": false,
+  "game_build": "REPLACE_WITH_EXACT_GAME_BUILD",
+  "mission_id": "REPLACE_WITH_CHECKPOINT_MISSION_ID",
+  "mod_fingerprint": "REPLACE_WITH_CHECKPOINT_MOD_FINGERPRINT",
+  "player_mapping": {
+    "base": null,
+    "count": null
+  }
+}
