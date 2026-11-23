@@ -5,6 +5,7 @@ evidence/
 checkpoint-store/
 **/plans/
 **/results/
+**/diagnostics/
 **/.incomplete-*/
 **/.*.lock
 **/save/

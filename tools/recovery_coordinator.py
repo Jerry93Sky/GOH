@@ -14,12 +14,17 @@ import re
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
-STATUSES = {"INCOMPLETE", "FILE_VERIFIED", "RESTORE_TEST_PENDING", "RESTORE_VERIFIED", "RESTORE_FAILED"}
+SCHEMA_VERSION = 2
+SUPPORTED_MANIFEST_VERSIONS = {1, 2}
+STATUSES = {"INCOMPLETE", "FILE_VERIFIED", "SOURCE_UNSTABLE", "RESTORE_TEST_PENDING", "RESTORE_VERIFIED", "RESTORE_FAILED"}
+DIAGNOSTIC_STATUSES = {"NONE", "SOURCE_MISSING", "SOURCE_AMBIGUOUS", "SOURCE_UNSTABLE", "SOURCE_READ_ERROR", "CAPTURE_ERROR"}
+TEST_IDS = {f"TEST-{letter}" for letter in "ABCDEF"}
+PLAN_TTL_SECONDS = 15 * 60
 CLIENT_SAVE = "coop_ckpt.sav"
 SERVER_SAVE = "coop_ckpt_srv.sav"
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -27,6 +32,10 @@ WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10
 
 
 class CoordinatorError(Exception):
+    pass
+
+
+class CaptureError(CoordinatorError):
     pass
 
 
@@ -42,6 +51,11 @@ def normalize_utc(value: str) -> str:
     if parsed.tzinfo is None:
         raise CoordinatorError("Checkpoint timestamp must include a UTC offset or Z")
     return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def add_utc_seconds(value: str, seconds: int) -> str:
+    parsed = datetime.fromisoformat(normalize_utc(value).replace("Z", "+00:00"))
+    return (parsed + timedelta(seconds=seconds)).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def safe_id(value: str, label: str) -> str:
@@ -149,6 +163,16 @@ def relative_source_path(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def source_stat(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "device": getattr(stat, "st_dev", 0),
+        "file_id": getattr(stat, "st_ino", 0),
+    }
+
+
 def capture(args: argparse.Namespace) -> dict[str, Any]:
     store = Path(args.store).expanduser().resolve()
     store.mkdir(parents=True, exist_ok=True)
@@ -195,7 +219,7 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
         if len(canonical) > 1:
             missing.append(f"participant:{player_id}/ambiguous-{CLIENT_SAVE}")
             diagnostics.append(f"participant {player_id}: found {len(canonical)} matching archives; expected exactly one")
-        for source_file in canonical:
+        for source_file in (canonical if len(canonical) == 1 else []):
             rel = relative_source_path(source_file, root)  # type: ignore[arg-type]
             target_rel = Path("data") / "participants" / player_id / Path(rel)
             copy_jobs.append(("participant", source_file, target_rel, f"participant:{player_id}"))
@@ -212,7 +236,7 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
     if len(canonical_server) > 1:
         missing.append(f"host_server/ambiguous-{SERVER_SAVE}")
         diagnostics.append(f"host_server: found {len(canonical_server)} matching archives; expected exactly one")
-    for source_file in canonical_server:
+    for source_file in (canonical_server if len(canonical_server) == 1 else []):
         rel = relative_source_path(source_file, server_root)  # type: ignore[arg-type]
         target_rel = Path("data") / "host_server" / Path(rel)
         copy_jobs.append(("host_server", source_file, target_rel, "host_server"))
@@ -223,10 +247,19 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
 
     captured_at = utc_now()
     checkpoint_time = normalize_utc(args.checkpoint_time_utc)
+    capture_run_id = safe_id(getattr(args, "capture_run_id", None) or uuid.uuid4().hex, "capture run ID")
     status = "INCOMPLETE" if missing else "FILE_VERIFIED"
+    diagnostic_status = "NONE"
+    if any("ambiguous-" in item for item in missing):
+        diagnostic_status = "SOURCE_AMBIGUOUS"
+    elif missing:
+        diagnostic_status = "SOURCE_MISSING"
+    if any("scan failed" in item for item in diagnostics):
+        diagnostic_status = "SOURCE_READ_ERROR"
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "checkpoint_id": checkpoint_id,
+        "capture_run_id": capture_run_id,
         "captured_at_utc": captured_at,
         "checkpoint_time_utc": checkpoint_time,
         "mission_id": mission_id,
@@ -234,33 +267,60 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
         "mod_fingerprint": mod_fingerprint,
         "expected_players": expected,
         "status": status,
+        "diagnostic_status": diagnostic_status,
         "files": [],
         "sources": inventory,
         "missing": missing,
         "diagnostics": diagnostics,
-        "integrity_scope": "SHA-256 and size of copied files only; game save semantics/loadability are not verified",
+        "integrity_scope": "source hashes/stat metadata are compared before, during and after copying; this does not prove the game finished writing or that the archive is loadable",
     }
 
     def populate(stage: Path) -> None:
         for kind, source_file, target_rel, owner in copy_jobs:
+            try:
+                source_before_stat = source_stat(source_file)
+                source_before_hash = sha256_file(source_file)
+            except OSError as exc:
+                raise CaptureError(f"Could not read source archive before copy: {source_file.name}: {exc}") from exc
             target = stage / target_rel
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source_file, target)
+            try:
+                shutil.copyfile(source_file, target)
+                copied_hash = sha256_file(target)
+                copied_size = target.stat().st_size
+                source_after_hash = sha256_file(source_file)
+                source_after_stat = source_stat(source_file)
+            except OSError as exc:
+                raise CaptureError(f"Copy/read failed for source archive {source_file.name}: {exc}") from exc
             with target.open("r+b") as copied:
                 copied.flush()
                 os.fsync(copied.fileno())
             size = target.stat().st_size
+            stable = (
+                source_before_stat == source_after_stat
+                and source_before_hash == source_after_hash == copied_hash
+                and copied_size == size == source_before_stat["size_bytes"]
+            )
             item = {
                 "owner": owner,
                 "kind": kind,
                 "path": target_rel.as_posix(),
                 "size_bytes": size,
-                "sha256": sha256_file(target),
-                "valid": size > 0,
+                "sha256": copied_hash,
+                "source_before": {**source_before_stat, "sha256": source_before_hash},
+                "source_after": {**source_after_stat, "sha256": source_after_hash},
+                "source_stable_during_copy": stable,
+                "valid": size > 0 and stable,
             }
             manifest["files"].append(item)
+            if not stable:
+                manifest["status"] = "SOURCE_UNSTABLE"
+                manifest["diagnostic_status"] = "SOURCE_UNSTABLE"
+                manifest["diagnostics"].append(f"source changed during copy: {item['path']}")
             if size == 0:
                 manifest["status"] = "INCOMPLETE"
+                if manifest["diagnostic_status"] == "NONE":
+                    manifest["diagnostic_status"] = "SOURCE_READ_ERROR"
                 manifest["diagnostics"].append(f"empty file: {item['path']}")
                 if item["path"] not in manifest["missing"]:
                     manifest["missing"].append(item["path"])
@@ -277,7 +337,7 @@ def load_manifest(directory: Path) -> dict[str, Any]:
             value = json.load(stream)
     except (OSError, json.JSONDecodeError) as exc:
         raise CoordinatorError(f"Unreadable manifest {manifest_path}: {exc}") from exc
-    if value.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(value, dict) or value.get("schema_version") not in SUPPORTED_MANIFEST_VERSIONS:
         raise CoordinatorError(f"Unsupported manifest schema in {manifest_path}")
     if value.get("checkpoint_id") != directory.name:
         raise CoordinatorError(f"Checkpoint directory/manifest ID mismatch: {directory}")
@@ -289,7 +349,47 @@ def load_manifest(directory: Path) -> dict[str, Any]:
         raise CoordinatorError(f"Invalid files/sources in {manifest_path}")
     if not all(isinstance(x, dict) for x in value["files"] + value["sources"]):
         raise CoordinatorError(f"Invalid file/source record in {manifest_path}")
+    # P0.5 schema v1 did not record diagnostic/source-stability metadata. Preserve it
+    # read-only and adapt missing time to the old package timestamp for ordering.
+    value.setdefault("diagnostic_status", "NONE")
+    value.setdefault("checkpoint_time_utc", value.get("captured_at_utc", ""))
+    value.setdefault("capture_run_id", "legacy")
+    if value.get("diagnostic_status") not in DIAGNOSTIC_STATUSES:
+        raise CoordinatorError(f"Invalid diagnostic_status in {manifest_path}")
     return value
+
+
+def read_test_results(store: Path, checkpoint_id: str) -> list[dict[str, Any]]:
+    """Read immutable P1-A run records plus the single P0.5 compatibility record."""
+    results: list[dict[str, Any]] = []
+    runs_dir = store / "results" / "runs"
+    if runs_dir.is_dir():
+        for path in sorted(runs_dir.glob("*.json")):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(record, dict) and record.get("checkpoint_id") == checkpoint_id:
+                results.append(record)
+    legacy_path = store / "results" / f"{checkpoint_id}.json"
+    if legacy_path.is_file():
+        try:
+            legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+            if isinstance(legacy, dict) and legacy.get("checkpoint_id") == checkpoint_id:
+                protocol = legacy.get("protocol", {})
+                results.append({
+                    "schema_version": legacy.get("schema_version", 1),
+                    "checkpoint_id": checkpoint_id,
+                    "test_run_id": protocol.get("test_run_id", f"legacy-{checkpoint_id}"),
+                    "test_id": protocol.get("test_id", "UNKNOWN"),
+                    "status": legacy.get("status"),
+                    "recorded_at_utc": legacy.get("recorded_at_utc", ""),
+                    "protocol": protocol,
+                    "legacy": True,
+                })
+        except (OSError, json.JSONDecodeError):
+            pass
+    return results
 
 
 def verify_manifest_files(directory: Path, manifest: dict[str, Any]) -> list[str]:
@@ -322,6 +422,8 @@ def verify_manifest_files(directory: Path, manifest: dict[str, Any]) -> list[str
             issues.append(f"size mismatch: {rel} (manifest {item.get('size_bytes')}, actual {size})")
         if digest != item.get("sha256"):
             issues.append(f"SHA-256 mismatch: {rel}")
+        if item.get("source_stable_during_copy") is False:
+            issues.append(f"source changed during capture: {rel}")
     return issues
 
 
@@ -341,6 +443,57 @@ def compatibility_issues(manifest: dict[str, Any], expected: list[str], mission:
     if not any(x.get("kind") == "host_server" for x in manifest.get("sources", [])):
         issues.append("host server source is absent")
     return issues
+
+
+def structure_issues(manifest: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    expected = set(manifest.get("expected_players", []))
+    participant_sources = {x.get("id") for x in manifest.get("sources", []) if x.get("kind") == "participant"}
+    if participant_sources != expected:
+        issues.append("participant source set differs from expected roster")
+    if not any(x.get("kind") == "host_server" for x in manifest.get("sources", [])):
+        issues.append("host server source is absent")
+    counts: dict[str, int] = {}
+    for item in manifest.get("files", []):
+        if not isinstance(item, dict):
+            issues.append("malformed file record")
+            continue
+        owner = str(item.get("owner", ""))
+        counts[owner] = counts.get(owner, 0) + 1
+        name = Path(str(item.get("path", ""))).name.casefold()
+        if owner.startswith("participant:") and name != CLIENT_SAVE.casefold():
+            issues.append(f"unexpected client archive for {owner}")
+        if owner == "host_server" and name != SERVER_SAVE.casefold():
+            issues.append("unexpected archive in host server source")
+    for player in expected:
+        if counts.get(f"participant:{player}") != 1:
+            issues.append(f"expected exactly one client archive for {player}")
+    if counts.get("host_server") != 1:
+        issues.append("expected exactly one host server archive")
+    return issues
+
+
+def plan_digest(plan: dict[str, Any]) -> str:
+    unsigned = dict(plan)
+    unsigned.pop("plan_sha256", None)
+    return hashlib.sha256(json.dumps(unsigned, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def test_results_digest(records: list[dict[str, Any]]) -> str:
+    stable_records = [{
+        "test_run_id": record.get("test_run_id"),
+        "test_id": record.get("test_id"),
+        "status": record.get("status"),
+        "recorded_at_utc": record.get("recorded_at_utc"),
+    } for record in records]
+    return hashlib.sha256(json.dumps(stable_records, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def stale_plan(existing: dict[str, Any], reason: str) -> dict[str, Any]:
+    response = dict(existing)
+    response["status"] = "STALE_PLAN"
+    response["diagnostics"] = list(response.get("diagnostics", [])) + [reason, "Create a new request-id to obtain a fresh plan."]
+    return response
 
 
 def plan_recovery(args: argparse.Namespace) -> dict[str, Any]:
@@ -367,10 +520,54 @@ def plan_recovery(args: argparse.Namespace) -> dict[str, Any]:
             raise CoordinatorError(f"Existing plan request is unreadable: {exc}") from exc
         if existing.get("request_signature") != request_signature:
             raise CoordinatorError("Duplicate request ID has different inputs; refusing to replace the prior plan")
+        if existing.get("plan_sha256") != plan_digest(existing):
+            raise CoordinatorError("Existing recovery plan failed its digest check; refusing to reuse it")
+        try:
+            if normalize_utc(existing.get("expires_at_utc", "")) <= utc_now():
+                return stale_plan(existing, "Recovery plan has expired")
+        except CoordinatorError:
+            return stale_plan(existing, "Recovery plan has no valid expiration")
+        selected_id = existing.get("checkpoint_id")
+        if selected_id:
+            directory = store / safe_id(selected_id, "checkpoint ID")
+            try:
+                manifest = load_manifest(directory)
+            except CoordinatorError as exc:
+                return stale_plan(existing, f"Selected checkpoint is no longer available: {exc}")
+            manifest_digest = sha256_file(directory / "manifest.json")
+            if manifest_digest != existing.get("selected_manifest_sha256"):
+                return stale_plan(existing, "Selected checkpoint manifest changed after planning")
+            issues = verify_manifest_files(directory, manifest) + structure_issues(manifest)
+            issues += compatibility_issues(manifest, expected, args.mission_id, args.game_build, args.mod_fingerprint)
+            if manifest.get("status") != "FILE_VERIFIED":
+                issues.append(f"selected checkpoint status changed to {manifest.get('status')}")
+            if issues:
+                return stale_plan(existing, "Selected checkpoint is no longer valid: " + "; ".join(issues))
+            if test_results_digest(read_test_results(store, selected_id)) != existing.get("selected_test_results_sha256"):
+                return stale_plan(existing, "Game test history changed after planning")
+            selected_time = normalize_utc(manifest.get("checkpoint_time_utc", ""))
+            for candidate_dir in store.iterdir():
+                if (not candidate_dir.is_dir() or candidate_dir.name.startswith(".")
+                        or candidate_dir.name in {"plans", "results", selected_id}):
+                    continue
+                try:
+                    candidate = load_manifest(candidate_dir)
+                    candidate_time = normalize_utc(candidate.get("checkpoint_time_utc", ""))
+                except CoordinatorError:
+                    continue
+                if candidate.get("status") != "FILE_VERIFIED":
+                    continue
+                if (compatibility_issues(candidate, expected, args.mission_id, args.game_build, args.mod_fingerprint)
+                        or structure_issues(candidate) or verify_manifest_files(candidate_dir, candidate)):
+                    continue
+                if candidate_time > selected_time:
+                    return stale_plan(existing, f"A newer compatible checkpoint appeared: {candidate.get('checkpoint_id')}")
         return existing
 
-    candidates: list[tuple[str, Path, dict[str, Any]]] = []
+    available: list[tuple[str, Path, dict[str, Any]]] = []
+    compatible: list[tuple[str, Path, dict[str, Any]]] = []
     excluded: list[dict[str, Any]] = []
+    successful_tests: list[tuple[str, str, str]] = []
     for directory in store.iterdir():
         if not directory.is_dir() or directory.name.startswith(".") or directory.name in {"plans", "results"}:
             continue
@@ -379,26 +576,45 @@ def plan_recovery(args: argparse.Namespace) -> dict[str, Any]:
         except CoordinatorError as exc:
             excluded.append({"checkpoint_id": directory.name, "reasons": [str(exc)]})
             continue
-        reasons = compatibility_issues(manifest, expected, args.mission_id, args.game_build, args.mod_fingerprint)
+        physical_issues = structure_issues(manifest) + verify_manifest_files(directory, manifest)
         if manifest.get("status") != "FILE_VERIFIED":
-            reasons.append(f"file status is {manifest.get('status')}, expected FILE_VERIFIED")
-        reasons.extend(verify_manifest_files(directory, manifest))
-        if reasons:
-            excluded.append({"checkpoint_id": manifest.get("checkpoint_id"), "reasons": reasons})
-            continue
+            physical_issues.append(f"file status is {manifest.get('status')}, expected FILE_VERIFIED")
         try:
             checkpoint_time = normalize_utc(manifest.get("checkpoint_time_utc", ""))
         except CoordinatorError as exc:
-            excluded.append({"checkpoint_id": manifest.get("checkpoint_id"), "reasons": [str(exc)]})
+            physical_issues.append(str(exc))
+            checkpoint_time = ""
+        if physical_issues:
+            excluded.append({"checkpoint_id": manifest.get("checkpoint_id"), "reasons": physical_issues})
             continue
-        candidates.append((checkpoint_time, directory, manifest))
+        available.append((checkpoint_time, directory, manifest))
+        for result in read_test_results(store, manifest["checkpoint_id"]):
+            if result.get("status") == "RESTORE_VERIFIED":
+                test_id = result.get("test_id", "UNKNOWN")
+                successful_tests.append((checkpoint_time, manifest["checkpoint_id"], test_id))
+        reasons = compatibility_issues(manifest, expected, args.mission_id, args.game_build, args.mod_fingerprint)
+        if reasons:
+            excluded.append({"checkpoint_id": manifest.get("checkpoint_id"), "reasons": reasons})
+            continue
+        compatible.append((checkpoint_time, directory, manifest))
 
-    if not candidates:
+    latest_available = max(available, key=lambda x: (x[0], x[1].name)) if available else None
+    latest_test_verified = max((x for x in successful_tests), default=None, key=lambda x: (x[0], x[1]))
+    latest_test_b_verified = max((x for x in successful_tests if x[2] == "TEST-B"), default=None, key=lambda x: (x[0], x[1]))
+    common = {
+        "schema_version": SCHEMA_VERSION,
+        **request,
+        "request_signature": request_signature,
+        "created_at_utc": utc_now(),
+        "expires_at_utc": add_utc_seconds(utc_now(), PLAN_TTL_SECONDS),
+        "latest_physically_available_checkpoint_id": latest_available[2]["checkpoint_id"] if latest_available else None,
+        "latest_game_test_verified_checkpoint_id": latest_test_verified[1] if latest_test_verified else None,
+        "latest_TEST_B_verified_checkpoint_id": latest_test_b_verified[1] if latest_test_b_verified else None,
+    }
+
+    if not compatible:
         plan = {
-            "schema_version": SCHEMA_VERSION,
-            **request,
-            "request_signature": request_signature,
-            "created_at_utc": utc_now(),
+            **common,
             "status": "INCOMPLETE",
             "checkpoint_id": None,
             "archives": [],
@@ -406,14 +622,14 @@ def plan_recovery(args: argparse.Namespace) -> dict[str, Any]:
             "diagnostics": ["No complete compatible checkpoint is available; no game action was taken."],
         }
     else:
-        _, directory, manifest = max(candidates, key=lambda x: (x[0], x[1].name))
+        _, directory, manifest = max(compatible, key=lambda x: (x[0], x[1].name))
         plan = {
-            "schema_version": SCHEMA_VERSION,
-            **request,
-            "request_signature": request_signature,
-            "created_at_utc": utc_now(),
+            **common,
             "status": "RESTORE_TEST_PENDING",
             "checkpoint_id": manifest["checkpoint_id"],
+            "selected_manifest_sha256": sha256_file(directory / "manifest.json"),
+            "selected_test_results_sha256": test_results_digest(read_test_results(store, manifest["checkpoint_id"])),
+            "selected_checkpoint_time_utc": manifest.get("checkpoint_time_utc"),
             "archives": [
                 {"owner": item["owner"], "path": str((directory / item["path"]).resolve()),
                  "size_bytes": item["size_bytes"], "sha256": item["sha256"]}
@@ -423,9 +639,11 @@ def plan_recovery(args: argparse.Namespace) -> dict[str, Any]:
             "diagnostics": [
                 "All recorded files passed size/SHA-256 checks and the roster/build/mission/mod keys match.",
                 "This plan does not prove that any archive is loadable or sufficient for all participants.",
+                "Physical availability and game-tested checkpoints are reported separately above.",
                 "Manual real-game restore testing is required; no game action was taken.",
             ],
         }
+    plan["plan_sha256"] = plan_digest(plan)
     try:
         write_json_fsynced(plan_path, plan)
     except FileExistsError:
@@ -444,9 +662,15 @@ def record_result(args: argparse.Namespace) -> dict[str, Any]:
         raise CoordinatorError("Explicit --confirm-real-game is required to attest the protocol was run in-game")
     store = Path(args.store).expanduser().resolve()
     checkpoint_id = safe_id(args.checkpoint_id, "checkpoint ID")
+    test_run_id = safe_id(args.test_run_id, "test run ID")
+    test_id = args.test_id
+    if test_id not in TEST_IDS:
+        raise CoordinatorError("test-id must be TEST-A through TEST-F")
     directory = store / checkpoint_id
     manifest = load_manifest(directory)
-    issues = verify_manifest_files(directory, manifest)
+    if manifest.get("status") != "FILE_VERIFIED":
+        raise CoordinatorError(f"Checkpoint package cannot receive a game result: {manifest.get('status')}")
+    issues = verify_manifest_files(directory, manifest) + structure_issues(manifest)
     if issues:
         raise CoordinatorError("Cannot attach a game result to a damaged checkpoint: " + "; ".join(issues))
     protocol_path = Path(args.protocol).expanduser().resolve()
@@ -454,12 +678,14 @@ def record_result(args: argparse.Namespace) -> dict[str, Any]:
         protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise CoordinatorError(f"Could not read experiment protocol JSON: {exc}") from exc
-    required = ["test_id", "executed_at_utc", "game_build", "participant_ids", "outcome", "evidence_files"]
+    required = ["test_run_id", "test_id", "executed_at_utc", "game_build", "participant_ids", "outcome", "evidence_files"]
     absent = [field for field in required if field not in protocol]
     if absent:
         raise CoordinatorError("Experiment protocol missing fields: " + ", ".join(absent))
     if protocol.get("checkpoint_id") != checkpoint_id:
         raise CoordinatorError("Experiment protocol checkpoint_id does not match")
+    if protocol.get("test_run_id") != test_run_id or protocol.get("test_id") != test_id:
+        raise CoordinatorError("Experiment protocol test_run_id/test_id does not match the request")
     if protocol.get("experiment_type") != "real_game":
         raise CoordinatorError("Only experiment_type=real_game is accepted for restore results")
     participants = protocol.get("participant_ids")
@@ -485,19 +711,22 @@ def record_result(args: argparse.Namespace) -> dict[str, Any]:
     result = {
         "schema_version": SCHEMA_VERSION,
         "checkpoint_id": checkpoint_id,
+        "test_run_id": test_run_id,
+        "test_id": test_id,
         "status": args.status,
         "recorded_at_utc": utc_now(),
         "protocol": protocol,
     }
-    results_dir = store / "results"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    result_path = results_dir / f"{checkpoint_id}.json"
+    runs_dir = store / "results" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    result_path = runs_dir / f"{test_run_id}.json"
     try:
         write_json_fsynced(result_path, result)
     except FileExistsError:
         existing = json.loads(result_path.read_text(encoding="utf-8"))
-        if existing.get("protocol") != protocol or existing.get("status") != args.status:
-            raise CoordinatorError("A different result already exists for this checkpoint; refusing to replace it")
+        if (existing.get("checkpoint_id") != checkpoint_id or existing.get("test_id") != test_id
+                or existing.get("protocol") != protocol or existing.get("status") != args.status):
+            raise CoordinatorError("test_run_id already exists with different result data; history is immutable")
         return existing
     return result
 
@@ -508,6 +737,7 @@ def build_parser() -> argparse.ArgumentParser:
     cap = sub.add_parser("capture", help="inventory and atomically publish an immutable checkpoint package")
     cap.add_argument("--store", required=True)
     cap.add_argument("--checkpoint-id", required=True)
+    cap.add_argument("--capture-run-id", help="unique ID for this filesystem capture attempt; generated if omitted")
     cap.add_argument("--checkpoint-time-utc", required=True, help="time the game checkpoint was saved, with timezone (e.g. 2026-11-23T14:30:00Z)")
     cap.add_argument("--mission-id", required=True)
     cap.add_argument("--game-build", required=True)
@@ -529,6 +759,8 @@ def build_parser() -> argparse.ArgumentParser:
     result = sub.add_parser("record-result", help="attach a real two-player game protocol to a checkpoint result")
     result.add_argument("--store", required=True)
     result.add_argument("--checkpoint-id", required=True)
+    result.add_argument("--test-run-id", required=True)
+    result.add_argument("--test-id", required=True, choices=sorted(TEST_IDS))
     result.add_argument("--status", required=True, choices=["RESTORE_VERIFIED", "RESTORE_FAILED"])
     result.add_argument("--protocol", required=True, help="JSON protocol from a real game experiment")
     result.add_argument("--confirm-real-game", action="store_true", help="attest that the protocol describes an actual game run")
@@ -542,6 +774,29 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = args.func(args)
     except (CoordinatorError, OSError) as exc:
+        if args.command == "capture" and isinstance(exc, (CaptureError, OSError)):
+            try:
+                store = Path(args.store).expanduser().resolve()
+                diagnostics_dir = store / "diagnostics" / "capture"
+                diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                run_id = safe_id(getattr(args, "capture_run_id", None) or uuid.uuid4().hex, "capture run ID")
+                report = {
+                    "schema_version": SCHEMA_VERSION,
+                    "capture_run_id": run_id,
+                    "checkpoint_id": getattr(args, "checkpoint_id", None),
+                    "status": "CAPTURE_ERROR",
+                    "diagnostic_status": "CAPTURE_ERROR",
+                    "recorded_at_utc": utc_now(),
+                    "error": str(exc),
+                    "diagnostics": ["No checkpoint package was published for this failed capture."],
+                }
+                report_path = diagnostics_dir / f"{run_id}.json"
+                write_json_fsynced(report_path, report)
+                report["diagnostic_report"] = str(report_path)
+                print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+                return 2
+            except (CoordinatorError, OSError):
+                pass
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
