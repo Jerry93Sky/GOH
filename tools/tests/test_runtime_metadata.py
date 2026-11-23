@@ -22,7 +22,7 @@ class RuntimeMetadataTests(unittest.TestCase):
         self.temp.cleanup()
 
     def log(self, text):
-        path = self.root / "goh_coop_checkpoint_game.log"
+        path = self.root / "goh_coop_checkpoint_call_to_arms.exe.log"
         path.write_text(text, encoding="utf-8")
         return path
 
@@ -162,8 +162,22 @@ reload ARMED: next start of 'campaign/test.mi' loads '@/profiles/765/save/coop_c
 
     def test_log_does_not_claim_session_role_or_game_build(self):
         d = self.collector.parse_log(self.log("scene load: mission 'campaign/test.mi'\n"))
-        self.assertEqual(d["role"].status, MISSING)
+        self.assertEqual(d["session_role"].status, MISSING)
         self.assertEqual(d["game_build"].status, MISSING)
+
+    def test_role_log_selection_requires_exact_role_and_rejects_ambiguity(self):
+        client = self.root / "goh_coop_checkpoint_call_to_arms.exe.log"
+        server = self.root / "goh_coop_checkpoint_call_to_arms_server.exe.log"
+        client.write_text("client", encoding="utf-8")
+        server.write_text("server", encoding="utf-8")
+        self.assertEqual(self.collector.select_role_log([client, server], "client"), client)
+        self.assertEqual(self.collector.select_role_log([client, server], "server"), server)
+        with self.assertRaises(ValueError):
+            self.collector.select_role_log([client], "server")
+        duplicate = self.root / "other" / client.name
+        duplicate.parent.mkdir(); duplicate.write_text("other", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.collector.select_role_log([client, duplicate], "client")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import time
 from typing import Any, Iterable
 
 import recovery_harness as harness
+from coop_log_sources import classify_log_role, select_role_log, sha256_file
 
 OBSERVED = "OBSERVED"
 OPERATOR_PROVIDED = "OPERATOR_PROVIDED"
@@ -31,6 +32,7 @@ class FieldValue:
     source_path: str | None
     observed_at_utc: str
     method: str
+    process_role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,17 +60,34 @@ class RuntimeMetadataCollector:
     _PLAYERS = re.compile(r"players: ids start after (\d+), (\d+) players \(normal start of '([^']+)'\)")
     _RELOAD = re.compile(r"reload ARMED: next start of '([^']+)' loads '([^']+)' \(player ids after (\d+), (\d+) players\)")
 
-    def _field(self, value: Any, status: str, source: Path | None, method: str) -> FieldValue:
-        return FieldValue(value, status, str(source) if source else None, utc_now(), method)
+    def _field(self, value: Any, status: str, source: Path | None, method: str,
+               process_role: str | None = None) -> FieldValue:
+        return FieldValue(value, status, str(source) if source else None, utc_now(), method, process_role)
+
+    @staticmethod
+    def classify_log_role(log_path: str | Path) -> str | None:
+        return classify_log_role(log_path)
+
+    def select_role_log(self, log_paths: Iterable[str | Path], role: str) -> Path:
+        return select_role_log(list(log_paths), role)
 
     def parse_log(self, log_path: str | Path) -> dict[str, FieldValue]:
         path = Path(log_path)
+        process_role = classify_log_role(path)
         result: dict[str, FieldValue] = {}
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
-            return {key: self._field(None, MISSING, path, "unreadable log") for key in
-                    ("internal_mission_path", "virtual_archive_base_path", "checkpoint_id", "quant_clock", "player_mapping", "write_completion")}
+            role_status = process_role or "UNVERIFIED"
+            result = {key: self._field(None, MISSING, path, "unreadable log", role_status) for key in
+                      ("internal_mission_path", "virtual_archive_base_path", "checkpoint_id", "quant_clock", "player_mapping", "write_completion")}
+            result["process_role"] = self._field(process_role, OBSERVED if process_role else UNVERIFIED,
+                path, "exact log basename", role_status)
+            result["session_role"] = self._field(None, MISSING, path,
+                "process log cannot establish network host/client", role_status)
+            result["game_build"] = self._field(None, MISSING, path, "not present in published log contract", role_status)
+            result["source_log_sha256"] = self._field(None, UNVERIFIED, path, "unreadable log", role_status)
+            return result
         def latest(pattern: re.Pattern[str]):
             for line in reversed(lines):
                 found = pattern.search(line)
@@ -80,25 +99,31 @@ class RuntimeMetadataCollector:
         written = latest(self._WRITTEN)
         players = latest(self._PLAYERS)
         reload = latest(self._RELOAD)
-        result["internal_mission_path"] = self._field(mission.group(1) if mission else None, OBSERVED if mission else MISSING, path, "published Coop Checkpoint log phrase")
+        role_status = process_role or "UNVERIFIED"
+        result["internal_mission_path"] = self._field(mission.group(1) if mission else None, OBSERVED if mission else MISSING, path, "published Coop Checkpoint log phrase", role_status)
         # The published source stores this in process memory but does not log it as the marker archive base.
         # The written line is a local save path and is deliberately not relabeled as the virtual path.
         result["virtual_archive_base_path"] = self._field(reload.group(2) if reload else None,
             OBSERVED if reload else MISSING, path,
-            "published reload ARMED marker line; checkpoint written line alone is only a local save path")
-        result["checkpoint_id"] = self._field(int(cp.group(1)) if cp else None, OBSERVED if cp else MISSING, path, "local process checkpoint sequence; not a cross-peer UUID")
-        result["quant_clock"] = self._field(int(cp.group(3)) if cp else None, OBSERVED if cp else MISSING, path, "published checkpoint log quant clock")
+            "published reload ARMED marker line; checkpoint written line alone is only a local save path", role_status)
+        result["checkpoint_id"] = self._field(int(cp.group(1)) if cp else None, OBSERVED if cp else MISSING, path, "local process checkpoint sequence; not a cross-peer UUID", role_status)
+        result["quant_clock"] = self._field(int(cp.group(3)) if cp else None, OBSERVED if cp else MISSING, path, "published checkpoint log quant clock", role_status)
         mapping = None
         if players:
             mapping = {"base": int(players.group(1)), "count": int(players.group(2))}
         elif reload:
             mapping = {"base": int(reload.group(3)), "count": int(reload.group(4))}
-        result["player_mapping"] = self._field(mapping, OBSERVED if mapping else MISSING, path, "published players/reload log phrase")
+        result["player_mapping"] = self._field(mapping, OBSERVED if mapping else MISSING, path, "published players/reload log phrase", role_status)
         result["write_completion"] = self._field(written.group(0) if written else None,
             OBSERVED if written else UNVERIFIED, path,
-            "author log phrase indicates local save completion only; no multi-peer synchronization ACK")
-        result["role"] = self._field(None, MISSING, path, "log filename does not prove network host/client/server role")
-        result["game_build"] = self._field(None, MISSING, path, "not present in parsed published log contract")
+            "author log phrase indicates local save completion only; no multi-peer synchronization ACK", role_status)
+        result["process_role"] = self._field(process_role, OBSERVED if process_role else UNVERIFIED,
+            path, "exact pinned Coop Checkpoint log basename identifies game or local server executable", role_status)
+        result["session_role"] = self._field(None, MISSING, path,
+            "game executable log does not distinguish host game from guest client", role_status)
+        result["game_build"] = self._field(None, MISSING, path, "not present in parsed published log contract", role_status)
+        result["source_log_sha256"] = self._field(sha256_file(path), OBSERVED if process_role else UNVERIFIED,
+            path, "SHA-256 of exact log source", role_status)
         return result
 
     def marker_metadata(self, marker_path: str | Path) -> dict[str, FieldValue]:

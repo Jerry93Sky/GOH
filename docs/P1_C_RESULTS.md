@@ -1,5 +1,7 @@
 # P1-C / V0.2 — результат реализации
 
+Для актуальных исправлений preflight, строгого выбора логов и подготовки marker используйте [P1-C.1 results](P1_C1_RESULTS.md); этот документ фиксирует состояние исходной V0.2 ветки.
+
 **Статус: EXPERIMENTAL BUILD PREPARED; READY_FOR_FIELD_TEST NOT YET ESTABLISHED.** Доступ к установленной игре и двум игровым клиентам в среде разработки отсутствует. TEST-A=NOT_RUN, TEST-B=NOT_RUN.
 
 ## Реализовано

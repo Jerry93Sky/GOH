@@ -2,6 +2,14 @@
 
 P0–P1-B не содержат игрового DLL/hook. Проект разделяет файловую логику, marker compatibility adapter, графический менеджер и будущий исследовательский game adapter.
 
+## P1-C.1 preflight hardening
+
+Метаданные выбираются только из двух process-specific логов, basename которых описан опубликованным исходником Coop Checkpoint: `goh_coop_checkpoint_call_to_arms.exe.log` и `goh_coop_checkpoint_call_to_arms_server.exe.log`. Идентификация типа процесса не подменяет операторскую session role `HOST`/`CLIENT`. Каждое поле сохраняет путь источника и process role.
+
+Preflight marker требует конкретную manifest-запись владельца/роли, положительный размер, SHA-256, совпадение импортированного архива и точного файла выбранного профиля. Client/server marker — независимые файлы и процессы; marker directory принимается только как родитель соответствующего role log. Если server log не обнаружен/не выбран однозначно, автоматическая подготовка прекращается.
+
+Сопоставление одной общей точки требует операционный JSON protocol с source path/hash и локальными sequence/quant clock каждого participant client process плюс host server process. `checkpoint #N` хранится отдельно на каждом процессе и не интерпретируется как общий ID. Даже валидный protocol получает статус `OPERATOR_PROTOCOL_RECORDED_NOT_SYNCHRONIZATION_PROOF`; сетевой ACK или движковое подтверждение не установлены.
+
 ## Компоненты
 
 1. **Core** — `recovery_coordinator.py` и `recovery_harness.py`: immutable checkpoints, SHA-256, file stability, per-peer package import/export, manifest validation и marker simulator. Core не подключается к игре.

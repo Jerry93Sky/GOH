@@ -1,39 +1,34 @@
 # GOH Coop Recovery
 
-Независимый экспериментальный Windows-инструмент для read-only наблюдения и подготовки файловых recovery экспериментов Call to Arms – Gates of Hell: Ostfront. Текущая ветка P1-C/V0.2 НЕ подтверждена реальной игрой; TEST-A и TEST-B должны оставаться NOT_RUN до соответствующих игровых прогонов.
+Независимый экспериментальный Windows x64 инструмент для исследования восстановления исторических кооперативных миссий Call to Arms – Gates of Hell: Ostfront из checkpoint после закрытия игровой сессии.
 
-V0.2 включает GUI на русском языке, выбор HOST/CLIENT, локальное наблюдение за известными Coop Checkpoint файлами, provenance метаданных, консервативный resolver virtual archive path, SHA-256 проверки, ручной обмен participant ZIP из полного checkpoint manifest, проверку набора peer ZIP и локальную запись отчёта TEST-A/B. Автоматического сетевого взаимодействия, runtime hooks и Hot Rejoin нет. Смотрите [результаты P1-C](docs/P1_C_RESULTS.md), [руководство наблюдения](docs/OBSERVATION_RU.md), [Recovery порядок](docs/RECOVERY_WIZARD_RU.md), [TEST-A](docs/TEST_A_RU.md) и [TEST-B](docs/TEST_B_RU.md).
+Текущий результат — **P1-C.1 / V0.2.1 Preflight Hardening**: автономный менеджер собирает локальные метаданные с явным provenance, проверяет отдельные архивы участников и хоста, и готовит role-specific marker только после строгой локальной проверки. Это подготовка к игровым экспериментам, не подтверждённый игровой recovery. `TEST-A=NOT_RUN`, `TEST-B=NOT_RUN`.
 
-Независимый экспериментальный проект для исследования восстановления исторических кооперативных миссий Call to Arms – Gates of Hell: Ostfront (Windows x64). Текущая ветка `codex/p1-b-experimental-build` добавляет P1-B офлайн Recovery Manager поверх P0–P1-A.
+## Ограничения
 
-## Статус
+- Реальной загрузки нового лобби на двух клиентах в этой среде не проверяли.
+- Локальное `checkpoint #N` не является общим идентификатором. Для preflight требуется ручной JSON протокол источников всех клиентов и server process хоста. Он не доказывает сетевую синхронность.
+- Client и server marker готовятся отдельно из точных логов соответствующих процессов. Путь каждого marker берётся из папки его role-specific лога, а не из TEMP менеджера.
+- Проект не добавляет игровые hooks/DLL, не меняет сетевой протокол, ресурсы игры, аутентификацию или защитные проверки.
 
-**V0.1 цель: READY_FOR_GAME_TEST. GAME_VERIFIED: НЕТ.** Реальная игра и два клиента на машине сборки недоступны. Windows GUI и пакетный формат проходят синтетические проверки; они не доказывают загрузку сохранений игровым движком. Результаты: [P1-B](docs/P1_B_RESULTS.md), [исследование маркеров P1-B](docs/P1_B_MARKER_COMPATIBILITY.md).
+## Документы
 
-## Что умеет V0.1
+- [Результаты P1-C.1](docs/P1_C1_RESULTS.md)
+- [Первый запуск с другом](docs/P1_C1_FIRST_RUN_RU.md)
+- [Наблюдение](docs/OBSERVATION_RU.md)
+- [Порядок подготовки recovery](docs/RECOVERY_WIZARD_RU.md)
+- [TEST-A](docs/TEST_A_RU.md) и [TEST-B](docs/TEST_B_RU.md)
 
-- Переносимый русский `GOHRecoveryManager.exe` (Windows x64): поиск Steam installation, ручной выбор игры, показ файловой версии, диагностика Coop Checkpoint/data mod.
-- Просмотр и SHA-256-проверка P1-A checkpoint, резервное копирование, экспорт отдельного пакета для каждого участника и импорт только в локальные папки.
-- В host package можно включить локальный server snapshot; гостевой пакет содержит только архив соответствующего гостя.
-- Режим A читает локальные авторские TEMP markers. Режим B экспериментально формирует marker только с точной mission path, archive base path, локальным архивом, build/mod metadata и player ID mapping.
-- Core не содержит игровых hooks, DLL или стороннего бинарного кода. Программа не подключается к сети игры, не меняет `version.dll` и не устанавливает мод автоматически.
-
-Установка и тест: [INSTALL](docs/INSTALL_RU.md), [первый запуск](docs/FIRST_RUN_RU.md), [TEST-A](docs/TEST_A_RU.md), [TEST-B](docs/TEST_B_RU.md), [диагностика](docs/TROUBLESHOOTING_RU.md).
-
-## Marker contract
-
-Исследованы исходники официального release tag Coop Checkpoint 1.0.4 на исходном коммите `e7f13b3c2ab9d764a351afca4005ed034c918cca`. Marker хранит внутренний mission path, виртуальный archive base path и опциональную строку `players base count`; это **не** абсолютный Windows путь к `.sav`. Loader ищет role-specific marker в Windows TEMP, принимает только marker не старше 15 минут, сравнивает mission path без регистра, удаляет marker при принятии и вызывает штатный path builder. Точный mapping необходим для owner remap. См. [дословные источники и независимый контракт](docs/P1_B_MARKER_COMPATIBILITY.md).
-
-Исходник и бинарный release третьей стороны не распространяются. Coop Checkpoint пользователь получает отдельно по [официальной странице автора](https://github.com/nicko996/goh-coop-mods/releases/tag/coop-checkpoint-v1.0.4); проверяйте условия лицензии у правообладателя.
-
-## Сборка и тесты
+## Проверки и сборка
 
 ```powershell
+python -m compileall -q tools
 python -m unittest discover -s tools/tests -v
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name GOHRecoveryManager --paths tools tools/goh_recovery_manager.py
-dist\GOHRecoveryManager.exe --smoke-test
 ```
 
-Workflow [Windows x64](.github/workflows/windows-v0.1.yml) запускает тесты и сборку и публикует ZIP как GitHub Actions artifact. [Успешный run #2](https://github.com/Jerry93Sky/GOH/actions/runs/45144792103) создал artifact `GOH-Coop-Recovery-V0.1-Experimental-win64`. Workflow не устанавливает игру и не выставляет `GAME_VERIFIED`.
+Windows workflow `.github/workflows/windows-v0.2.1.yml` собирает EXE, запускает smoke test, тесты и создаёт `GOH-Coop-Recovery-V0.2.1-FieldTest-win64.zip` как Actions artifact. Сборка не устанавливает файлы в игру и не заменяет `version.dll`.
 
-**Блокер:** отсутствуют реальные двухклиентские TEST-A/TEST-B, точный mapping, корректные runtime metadata для выбранной миссии/build, подтверждение межсессионной загрузки и лицензия для повторной публикации кода Coop Checkpoint. Непроверенные values нельзя вводить по догадке.
+## Независимость и лицензии
+
+Проект реализован независимо; исходники и бинарники Coop Checkpoint и CoA Script Extender сюда не включены. Использованные опубликованные контракты и проверка условий лицензирования описаны в [P0/P1 документах](docs/RISKS_AND_LICENSES.md). Используйте внешние инструменты только согласно лицензиям их авторов.

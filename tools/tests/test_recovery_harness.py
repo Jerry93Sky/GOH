@@ -46,6 +46,40 @@ class RecoveryHarnessTests(unittest.TestCase):
         })()
         return rc.capture(args)
 
+    def protocol(self, mission="mission-x"):
+        records = []
+        for participant, role in (("host", "client"), ("guest", "client"), ("host", "server")):
+            suffix = "call_to_arms_server.exe" if role == "server" else "call_to_arms.exe"
+            log = self.root / "logs" / participant / f"goh_coop_checkpoint_{suffix}.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(f"synthetic {participant} {role} log", encoding="utf-8")
+            records.append({"participant_id": participant, "process_role": role,
+                "source_log_path": str(log.resolve()), "source_log_sha256": rh.sha256_file(log),
+                "internal_mission_path": "campaign/x.mi", "virtual_archive_base_path": "@/profiles/guest/save/coop_ckpt/" if role == "client" else "@/profiles/host/save/coop_ckpt_srv/",
+                "local_checkpoint_sequence": 17 if participant == "host" else 22, "quant_clock": 881,
+                "observed_at_utc": "2026-11-23T12:00:00Z"})
+        return {"schema": "goh-checkpoint-consistency-protocol-v1", "checkpoint_id": "operator-event-1",
+            "package_checkpoint_id": "cp-test",
+            "mission_id": mission, "host_player_id": "host", "operator_confirmed_same_checkpoint_event": True,
+            "participants": records}
+
+    def marker_metadata(self, role="client", player="guest", profile=None):
+        protocol = self.protocol()
+        item = next(x for x in protocol["participants"] if x["participant_id"] == player and x["process_role"] == role)
+        profile = profile or (self.root / "profile")
+        path = Path(item["source_log_path"])
+        return {"checkpoint_id": "cp-test", "internal_mission_path": item["internal_mission_path"],
+            "archive_path": item["virtual_archive_base_path"], "player_id": player,
+            "game_build": "1.069.0", "mission_id": "mission-x", "mod_fingerprint": "mods-sha",
+            "is_host": player == "host", "role": role,
+            "player_mapping": {"base": 4, "count": 2}, "profile_root": str(profile),
+            "profile_id": player, "process_role": role, "source_log_path": str(path),
+            "source_log_sha256": rh.sha256_file(path), "consistency_protocol": protocol,
+            "host_player_id": "host", "observed_log_fields": {
+                "internal_mission_path": item["internal_mission_path"],
+                "virtual_archive_base_path": item["virtual_archive_base_path"],
+                "quant_clock": item["quant_clock"], "checkpoint_id": item["local_checkpoint_sequence"]}}
+
     def test_two_participant_packages_and_host_server_import(self):
         self.capture()
         for player in ("host", "guest"):
@@ -173,9 +207,8 @@ class RecoveryHarnessTests(unittest.TestCase):
         self.capture()
         local = self.root / "local"
         self.write(local / "coop_ckpt.sav", b"client-guest")
-        meta = {"checkpoint_id": "cp-test", "internal_mission_path": "campaign/x.mi", "archive_path": "@/profiles/guest/save/coop_ckpt/", "player_id": "guest",
-                "game_build": "1.069.0", "mission_id": "mission-x", "mod_fingerprint": "mods-sha",
-                "is_host": False, "role": "client"}
+        meta = self.marker_metadata()
+        meta.pop("player_mapping")
         with self.assertRaisesRegex(rh.HarnessError, "readiness"):
             rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", self.root / "temp")
         with self.assertRaisesRegex(rh.HarnessError, "player_mapping"):
@@ -187,17 +220,94 @@ class RecoveryHarnessTests(unittest.TestCase):
         self.write(local / "coop_ckpt.sav", b"client-guest")
         profile = self.root / "profile"
         self.write(profile / "save" / "coop_ckpt.sav", b"client-guest")
-        meta = {"checkpoint_id": "cp-test", "internal_mission_path": "campaign/x.mi", "archive_path": "@/profiles/guest/save/coop_ckpt/", "player_id": "guest",
-                "game_build": "1.069.0", "mission_id": "mission-x", "mod_fingerprint": "mods-sha",
-                "is_host": False, "role": "client", "player_mapping": {"base": 4, "count": 2}, "profile_root": str(profile), "profile_id": "guest"}
-        path = rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", self.root / "temp", True)
+        meta = self.marker_metadata(profile=profile)
+        marker_dir = Path(meta["source_log_path"]).parent
+        path = rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", marker_dir, True)
         marker, issues = rh.parse_marker(path)
         self.assertFalse(issues)
         self.assertEqual(marker.mission, "campaign/x.mi")
         self.assertEqual(marker.archive, "@/profiles/guest/save/coop_ckpt/")
         self.assertEqual(marker.players_base, 4)
         with self.assertRaisesRegex(rh.HarnessError, "already exists"):
-            rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", self.root / "temp", True)
+            rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", marker_dir, True)
+
+    def test_wrong_role_log_blocks_marker_preflight(self):
+        self.capture()
+        local = self.root / "local"; self.write(local / "coop_ckpt.sav", b"client-guest")
+        meta = self.marker_metadata()
+        profile = Path(meta["profile_root"]); self.write(profile / "save" / "coop_ckpt.sav", b"client-guest")
+        wrong = self.root / "wrong" / "goh_coop_checkpoint_call_to_arms_server.exe.log"
+        wrong.parent.mkdir(); wrong.write_text("wrong role", encoding="utf-8")
+        meta["source_log_path"] = str(wrong)
+        meta["source_log_sha256"] = rh.sha256_file(wrong)
+        with self.assertRaisesRegex(rh.HarnessError, "filename does not match"):
+            rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", wrong.parent, True)
+
+    def test_missing_archive_manifest_record_blocks_marker(self):
+        self.capture()
+        checkpoint = self.store / "cp-test"
+        manifest_path = checkpoint / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"] = [item for item in manifest["files"] if item.get("owner") != "participant:guest"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        local = self.root / "local"; self.write(local / "coop_ckpt.sav", b"client-guest")
+        meta = self.marker_metadata()
+        with self.assertRaises(rh.HarnessError):
+            rh.prepare_marker(checkpoint, meta, "client", local / "coop_ckpt.sav", Path(meta["source_log_path"]).parent, True)
+
+    def test_manifest_sha_mismatch_blocks_marker(self):
+        self.capture()
+        checkpoint = self.store / "cp-test"
+        manifest_path = checkpoint / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        next(item for item in manifest["files"] if item.get("owner") == "participant:guest")["sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        local = self.root / "local"; self.write(local / "coop_ckpt.sav", b"client-guest")
+        meta = self.marker_metadata()
+        with self.assertRaises(rh.HarnessError):
+            rh.prepare_marker(checkpoint, meta, "client", local / "coop_ckpt.sav", Path(meta["source_log_path"]).parent, True)
+
+    def test_profile_id_mismatch_blocks_marker(self):
+        self.capture()
+        local = self.root / "local"; self.write(local / "coop_ckpt.sav", b"client-guest")
+        profile = self.root / "profile"; self.write(profile / "save" / "coop_ckpt.sav", b"client-guest")
+        meta = self.marker_metadata(profile=profile); meta["profile_id"] = "other-profile"
+        with self.assertRaisesRegex(rh.HarnessError, "UNVERIFIED_PATH"):
+            rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", Path(meta["source_log_path"]).parent, True)
+
+    def test_missing_server_archive_blocks_server_marker(self):
+        self.capture(missing_server=True)
+        local = self.root / "local"; self.write(local / "coop_ckpt_srv.sav", b"server-state")
+        profile = self.root / "profile"; self.write(profile / "save" / "coop_ckpt_srv.sav", b"server-state")
+        meta = self.marker_metadata(role="server", player="host", profile=profile)
+        with self.assertRaises(rh.HarnessError):
+            rh.prepare_marker(self.store / "cp-test", meta, "server", local / "coop_ckpt_srv.sav", Path(meta["source_log_path"]).parent, True)
+
+    def test_incomplete_metadata_and_safe_cancel_do_not_create_marker(self):
+        self.capture()
+        local = self.root / "local"; self.write(local / "coop_ckpt.sav", b"client-guest")
+        meta = self.marker_metadata(); marker_dir = Path(meta["source_log_path"]).parent
+        self.write(Path(meta["profile_root"]) / "save" / "coop_ckpt.sav", b"client-guest")
+        incomplete = dict(meta); incomplete.pop("source_log_sha256")
+        with self.assertRaisesRegex(rh.HarnessError, "Missing role-specific"):
+            rh.prepare_marker(self.store / "cp-test", incomplete, "client", local / "coop_ckpt.sav", marker_dir, True)
+        with self.assertRaisesRegex(rh.HarnessError, "readiness"):
+            rh.prepare_marker(self.store / "cp-test", meta, "client", local / "coop_ckpt.sav", marker_dir, False)
+        self.assertFalse((marker_dir / rh.CLIENT_MARKER).exists())
+
+    def test_peer_group_requires_manual_consistency_protocol_without_claiming_sync(self):
+        self.capture()
+        packages=[]
+        for player in ("host", "guest"):
+            package=self.root / f"protocol-{player}.zip"
+            rh.build_peer_package(self.store / "cp-test", player, package, include_host_server=player == "host")
+            packages.append(package)
+        result = rh.validate_peer_group(packages, "host")
+        self.assertEqual(result["checkpoint_consistency_status"], "MISSING_OR_INCOMPLETE_MANUAL_PROTOCOL")
+        self.assertEqual(result["automatic_marker_preparation"], "BLOCKED")
+        result = rh.validate_peer_group(packages, "host", self.protocol())
+        self.assertEqual(result["checkpoint_consistency_status"], "OPERATOR_PROTOCOL_RECORDED_NOT_SYNCHRONIZATION_PROOF")
+        self.assertNotEqual(result["checkpoint_consistency_status"], "SYNCHRONIZED")
 
     def test_import_refuses_overwrite_and_rollback_on_partial_import(self):
         self.capture()
@@ -245,14 +355,15 @@ class RecoveryHarnessTests(unittest.TestCase):
     def test_coop_log_diagnostics_are_filtered_and_path_redacted(self):
         logs = self.root / "temp"
         logs.mkdir()
-        (logs / "goh_coop_checkpoint_game.log").write_text(
+        (logs / "goh_coop_checkpoint_call_to_arms.exe.log").write_text(
             "noise line\nERROR reload failed C:\\Users\\Somebody\\Documents\\profiles\\abc\\save\n",
             encoding="utf-8")
         lines = rh.read_coop_diagnostics(logs)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("ERROR", lines[0])
-        self.assertNotIn("C:\\Users\\Somebody", lines[0])
-        self.assertIn("<redacted>", lines[0])
+        self.assertTrue(any("[client process]" in line for line in lines))
+        self.assertTrue(any("[server process]" in line for line in lines))
+        self.assertTrue(any("ERROR" in line for line in lines))
+        self.assertFalse(any("C:\\Users\\Somebody" in line for line in lines))
+        self.assertTrue(any("<redacted>" in line for line in lines))
 
     def test_unknown_game_version_and_restarted_manager_smoke(self):
         self.assertEqual(manager.smoke_check(), 0)

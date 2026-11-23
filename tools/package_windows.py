@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble the portable V0.2 ZIP without touching a game installation."""
+"""Assemble the portable V0.2.1 ZIP without touching a game installation."""
 from __future__ import annotations
 
 import argparse
@@ -15,14 +15,15 @@ DOCS = (
     "INSTALL_RU.md", "FIRST_RUN_RU.md", "TEST_A_RU.md", "TEST_B_RU.md",
     "TROUBLESHOOTING_RU.md", "RECOVERY_METADATA_TEMPLATE_RU.json",
     "P1_C_RESULTS.md", "OBSERVATION_RU.md", "RECOVERY_WIZARD_RU.md",
-    "DIAGNOSTIC_REPORT_TEMPLATE_RU.json",
+    "DIAGNOSTIC_REPORT_TEMPLATE_RU.json", "P1_C1_FIRST_RUN_RU.md", "P1_C1_RESULTS.md",
 )
 REQUIRED = {
     "GOHRecoveryManager.exe", "config/default.json", "docs/INSTALL_RU.md",
     "docs/FIRST_RUN_RU.md", "docs/TEST_A_RU.md", "docs/TEST_B_RU.md",
     "docs/TROUBLESHOOTING_RU.md", "docs/RECOVERY_METADATA_TEMPLATE_RU.json",
     "docs/P1_C_RESULTS.md", "docs/OBSERVATION_RU.md", "docs/RECOVERY_WIZARD_RU.md",
-    "docs/DIAGNOSTIC_REPORT_TEMPLATE_RU.json", "checksums.sha256", "VERSION.txt",
+    "docs/DIAGNOSTIC_REPORT_TEMPLATE_RU.json", "docs/P1_C1_FIRST_RUN_RU.md",
+    "docs/P1_C1_RESULTS.md", "checksums.sha256", "VERSION.txt",
 }
 
 
@@ -30,7 +31,7 @@ def package(repository: Path, dist: Path) -> Path:
     exe = dist / "GOHRecoveryManager.exe"
     if not exe.is_file() or exe.stat().st_size < 100_000:
         raise RuntimeError("Windows manager EXE is missing or unexpectedly small")
-    output = dist / "GOH-Coop-Recovery-V0.2-FieldTest-win64.zip"
+    output = dist / "GOH-Coop-Recovery-V0.2.1-FieldTest-win64.zip"
     with tempfile.TemporaryDirectory(prefix="goh-dist-", dir=dist) as temporary:
         temp_root = Path(temporary)
         stage = temp_root / "GOH-Coop-Recovery"
@@ -41,7 +42,7 @@ def package(repository: Path, dist: Path) -> Path:
         for name in DOCS:
             shutil.copy2(repository / "docs" / name, stage / "docs" / name)
         (stage / "VERSION.txt").write_text(
-            "GOH Coop Recovery V0.2 Field-Test\nStatus: EXPERIMENTAL; TEST-A=NOT_RUN; TEST-B=NOT_RUN\nArchitecture: Windows x64\nPython runtime: bundled by PyInstaller one-file executable\nThird-party runtime DLLs are not separately redistributed\n",
+            "GOH Coop Recovery V0.2.1 Field-Test\nStatus: EXPERIMENTAL; TEST-A=NOT_RUN; TEST-B=NOT_RUN\nArchitecture: Windows x64\nPython runtime: bundled by PyInstaller one-file executable\nThird-party runtime DLLs are not separately redistributed\n",
             encoding="utf-8",
         )
         digest = hashlib.sha256((stage / "GOHRecoveryManager.exe").read_bytes()).hexdigest()

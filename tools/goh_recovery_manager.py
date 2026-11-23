@@ -24,7 +24,7 @@ import runtime_metadata as runtime
 from archive_path_resolver import ArchivePathResolver
 import field_test_report as field_reports
 
-APP_VERSION = "0.2.0-field-test"
+APP_VERSION = "0.2.1-field-test"
 APP_ID = "400750"
 
 
@@ -117,13 +117,15 @@ def smoke_check() -> int:
 class Manager(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("GOH Coop Recovery Manager — V0.2 field test")
+        self.title("GOH Coop Recovery Manager — V0.2.1 field test")
         self.geometry("1040x720")
         self.minsize(850, 600)
         self.game_dir = tk.StringVar()
         self.store_dir = tk.StringVar(value=str(default_store()))
         self.checkpoint_dir = tk.StringVar()
         self.profile_dir = tk.StringVar()
+        self.client_log_path = tk.StringVar()
+        self.server_log_path = tk.StringVar()
         self.session_role = tk.StringVar(value="CLIENT")
         self.observation_status = tk.StringVar(value="Наблюдение выключено")
         self.collector = runtime.RuntimeMetadataCollector()
@@ -138,7 +140,7 @@ class Manager(tk.Tk):
         header = ttk.Frame(self, padding=(12, 10))
         header.pack(fill="x")
         ttk.Label(header, text="GOH Coop Recovery", font=("Segoe UI", 18, "bold")).pack(side="left")
-        ttk.Label(header, text="V0.2 • ЭКСПЕРИМЕНТ • ИГРОВОЙ ТЕСТ: НЕ ПРОВЕДЁН", foreground="#9a5700").pack(side="right")
+        ttk.Label(header, text="V0.2.1 • ЭКСПЕРИМЕНТ • TEST-A/B: NOT_RUN", foreground="#9a5700").pack(side="right")
         bar = ttk.Frame(self, padding=(12, 0, 12, 8))
         bar.pack(fill="x")
         ttk.Label(bar, text="Папка игры:").grid(row=0, column=0, sticky="w")
@@ -209,6 +211,12 @@ class Manager(tk.Tk):
         role_row = ttk.Frame(self.observation); role_row.pack(anchor="w", pady=5)
         ttk.Label(role_row, text="Роль этого компьютера:").pack(side="left")
         ttk.Combobox(role_row, textvariable=self.session_role, values=("HOST", "CLIENT"), state="readonly", width=12).pack(side="left", padx=6)
+        for label, variable, process_role in (("Лог game/client process:", self.client_log_path, "client"),
+                                               ("Лог локального server process (HOST):", self.server_log_path, "server")):
+            log_row = ttk.Frame(self.observation); log_row.pack(fill="x", pady=2)
+            ttk.Label(log_row, text=label, width=38).pack(side="left")
+            ttk.Entry(log_row, textvariable=variable).pack(side="left", fill="x", expand=True)
+            ttk.Button(log_row, text="Выбрать лог…", command=lambda v=variable, r=process_role: self.choose_role_log(v, r)).pack(side="left", padx=5)
         buttons = ttk.Frame(self.observation); buttons.pack(anchor="w", pady=5)
         ttk.Button(buttons, text="Наблюдать за сохранениями", command=self.start_observation).pack(side="left")
         ttk.Button(buttons, text="Остановить наблюдение", command=self.stop_observation).pack(side="left", padx=6)
@@ -216,7 +224,31 @@ class Manager(tk.Tk):
         ttk.Label(self.observation, textvariable=self.observation_status, foreground="#245b31").pack(anchor="w", pady=4)
         self.observation_text = tk.Text(self.observation, wrap="word")
         self.observation_text.pack(fill="both", expand=True, pady=6)
-        self._text(self.observation_text, "Каждое поле сопровождается источником и методом. Стабильность файла не доказывает завершение синхронной записи на всех компьютерах. Роль HOST/CLIENT задаётся оператором и не выводится из имени процесса.\n")
+        self._text(self.observation_text, "Для каждой роли используется только точный лог: call_to_arms.exe.log для game process и call_to_arms_server.exe.log для локального server process. Роль HOST/CLIENT задаётся отдельно. Для сервера укажите лог из TEMP именно серверного процесса; разные TEMP блокируют подготовку, если этот путь не установлен. Каждое поле сопровождается источником и методом.\n")
+
+    def choose_role_log(self, variable: tk.StringVar, role: str) -> None:
+        expected = "goh_coop_checkpoint_call_to_arms.exe.log" if role == "client" else "goh_coop_checkpoint_call_to_arms_server.exe.log"
+        selected = filedialog.askopenfilename(title=f"Выберите точный {role} process log", filetypes=[("Ожидаемый лог", expected), ("Все файлы", "*.*")])
+        if selected:
+            if Path(selected).name.casefold() != expected.casefold():
+                messagebox.showerror("Неверная роль лога", f"Для {role} ожидается файл {expected}.")
+                return
+            variable.set(str(Path(selected).resolve()))
+
+    def _role_log_path(self, role: str, required: bool = True) -> Path | None:
+        variable = self.client_log_path if role == "client" else self.server_log_path
+        selected = variable.get().strip()
+        if not selected:
+            if required:
+                raise harness.HarnessError(f"UNSELECTED_ROLE_LOG: выберите точный файл лога {role} process; TEMP менеджера не используется как предположение")
+            return None
+        candidates = [Path(selected)]
+        try:
+            return self.collector.select_role_log(candidates, role)
+        except Exception as exc:
+            if required:
+                raise harness.HarnessError(f"Нет однозначного {role} process log: {exc}") from exc
+            return None
 
     def choose_profile(self) -> None:
         path = filedialog.askdirectory(title="Выберите корень профиля (содержит save)")
@@ -253,22 +285,22 @@ class Manager(tk.Tk):
         if not profile.is_dir():
             messagebox.showwarning("Наблюдение", "Сначала выберите существующую папку профиля.")
             return
-        logs = sorted(Path(tempfile.gettempdir()).glob("goh_coop_checkpoint_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
         selected_game = Path(self.game_dir.get()).expanduser() if self.game_dir.get() else Path("__no_game_selected__")
-        fields = self._metadata_context(logs[0] if logs else None, profile, selected_game)
         files = self._observation_files()
         if not files:
             self._append_observation("Сохранения coop_ckpt.sav / coop_ckpt_srv.sav не найдены в выбранном profile\\save.")
         for source in files:
             role = "server" if source.name.casefold() == "coop_ckpt_srv.sav" else "client"
             try:
+                log_path = self._role_log_path(role)
+                fields = self._metadata_context(log_path, profile, selected_game)
                 snap = self.collector.observe_save(source, role, Path(self.store_dir.get()) / "observed-local", fields, stable_interval=2.0, stable_samples=2)
                 record = snap.to_dict()
                 record["session_role"] = {"value": self.session_role.get(), "status": runtime.OPERATOR_PROVIDED,
                     "source_path": None, "observed_at_utc": runtime.utc_now(), "method": "GUI operator selection"}
                 out = Path(self.store_dir.get()) / "observed-local" / (Path(snap.copy_path).parent.name + ".json")
                 out.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                self._append_observation(f"Локальная копия проверена: {source.name}; {snap.size_bytes} байт; SHA-256 {snap.sha256}; {snap.engine_write_confirmation}.\n" + ", ".join(f"{k}={v.value!r} [{v.status}]" for k, v in snap.metadata.items()))
+                self._append_observation(f"Роль {role}; источник метаданных: {log_path}; архив: {source}; {snap.size_bytes} байт; SHA-256 {snap.sha256}; {snap.engine_write_confirmation}.\n" + ", ".join(f"{k}={v.value!r} [{v.status}] source={v.source_path} process_role={v.process_role}" for k, v in snap.metadata.items()))
             except Exception as exc:
                 self._append_observation(f"Наблюдение остановлено для {source.name}: {exc}")
 
@@ -280,7 +312,11 @@ class Manager(tk.Tk):
             messagebox.showwarning("Наблюдение", "Выберите корень профиля до запуска наблюдения.")
             return
         watch_files = [profile / "save" / n for n in ("coop_ckpt.sav", "coop_ckpt_srv.sav")]
-        watch_files += list(Path(tempfile.gettempdir()).glob("goh_coop_checkpoint_*.log"))
+        for process_role in ("client", "server"):
+            try:
+                watch_files.append(self._role_log_path(process_role))
+            except harness.HarnessError:
+                pass
         watch_files = [p for p in watch_files if p.parent.is_dir()]
         if not watch_files:
             messagebox.showinfo("Наблюдение", "Каталог профиля недоступен.")
@@ -310,8 +346,8 @@ class Manager(tk.Tk):
                 def snapshot_worker(source=path, archive_role=role, out_root=store_root, selected_role=operator_role,
                                     profile_root=selected_profile, game_root=selected_game):
                     try:
-                        log_candidates = sorted(Path(tempfile.gettempdir()).glob("goh_coop_checkpoint_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
-                        metadata = self._metadata_context(log_candidates[0] if log_candidates else None, profile_root, game_root)
+                        log_path = self._role_log_path(archive_role)
+                        metadata = self._metadata_context(log_path, profile_root, game_root)
                         snap = self.collector.observe_save(source, archive_role,
                             out_root, metadata, stable_interval=2, stable_samples=3, cancel=self._watch_stop)
                         record = snap.to_dict()
@@ -323,7 +359,7 @@ class Manager(tk.Tk):
                 threading.Thread(target=snapshot_worker, name="GOH-save-copy", daemon=True).start()
             elif path.name == "snapshot":
                 snap, record = signature
-                self._append_observation(f"Снимок сохранён отдельно и проверен: {snap.copy_path}; SHA-256={snap.sha256}; {snap.engine_write_confirmation}")
+                self._append_observation(f"Снимок {snap.role}: источник метаданных={snap.metadata.get('process_role').source_path if snap.metadata.get('process_role') else None}; архив={snap.source_path}; копия={snap.copy_path}; SHA-256={snap.sha256}; {snap.engine_write_confirmation}")
                 try:
                     output = Path(snap.copy_path).parent / "observation.json"
                     output.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -559,27 +595,43 @@ class Manager(tk.Tk):
         host = self.ask_value("HOST participant ID", "Введите player ID компьютера-хоста:")
         if not host:
             return
-        result = harness.validate_peer_group(list(packages), host)
+        protocol_path = filedialog.askopenfilename(title="Выберите ручной протокол сопоставления checkpoint (JSON); без него preflight блокируется", filetypes=[("JSON", "*.json")])
+        protocol = None
+        if protocol_path:
+            try:
+                protocol = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                messagebox.showerror("Протокол checkpoint", f"Не удалось прочитать JSON: {exc}")
+                return
+        result = harness.validate_peer_group(list(packages), host, protocol)
         messagebox.showinfo("Проверка набора файлов", json.dumps(result, ensure_ascii=False, indent=2))
 
     def inspect_markers(self) -> None:
-        temp = Path(tempfile.gettempdir())
         lines = []
-        for name in (harness.CLIENT_MARKER, harness.SERVER_MARKER):
-            path = temp / name
+        for role, name in (("client", harness.CLIENT_MARKER), ("server", harness.SERVER_MARKER)):
+            try:
+                log = self._role_log_path(role)
+            except harness.HarnessError as exc:
+                lines.append(f"{role}: marker path unknown; {exc}")
+                continue
+            path = log.parent / name
             marker, issues = harness.parse_marker(path)
             if issues:
-                lines.append(f"{name}: " + "; ".join(issues))
+                lines.append(f"{role}: source log={log}; marker={path}: " + "; ".join(issues))
             else:
-                lines.append(f"{name}: mission={marker.mission}; archive={marker.archive}; players={marker.players_base}/{marker.players_count}; сопоставление текущей миссии и существование архива проверяются отдельно")
-        messagebox.showinfo("TEMP-маркеры", "\n".join(lines) + "\n\nРежим A только читает файлы; игра самостоятельно удаляет принятый/просроченный marker.")
+                lines.append(f"{role}: source log={log}; marker={path}; mission={marker.mission}; archive={marker.archive}; players={marker.players_base}/{marker.players_count}; runtime match проверяется отдельно")
+        messagebox.showinfo("Role-specific markers", "\n".join(lines) + "\n\nРежим только читает файлы; игра самостоятельно удаляет принятый/просроченный marker.")
 
     def backup_markers(self) -> None:
-        temp = Path(tempfile.gettempdir())
         backup_dir = default_store().parent / "backups" / "markers"
         saved = []
-        for name in (harness.CLIENT_MARKER, harness.SERVER_MARKER):
-            path = temp / name
+        for role, name in (("client", harness.CLIENT_MARKER), ("server", harness.SERVER_MARKER)):
+            try:
+                log = self._role_log_path(role)
+            except harness.HarnessError as exc:
+                saved.append(f"{role}: backup skipped; {exc}")
+                continue
+            path = log.parent / name
             if path.exists():
                 try:
                     saved.append(str(harness.backup_marker(path, backup_dir)))
@@ -588,7 +640,13 @@ class Manager(tk.Tk):
         messagebox.showinfo("Резервная копия marker", "\n".join(saved) if saved else "Существующих маркеров нет.")
 
     def show_coop_logs(self) -> None:
-        lines = harness.read_coop_diagnostics(tempfile.gettempdir())
+        role_logs = {}
+        for role in ("client", "server"):
+            try:
+                role_logs[role] = self._role_log_path(role)
+            except harness.HarnessError:
+                pass
+        lines = harness.read_coop_diagnostics(tempfile.gettempdir(), role_logs=role_logs)
         self.diag_text.configure(state="normal")
         self.diag_text.delete("1.0", "end")
         self.diag_text.insert("end", "\n".join(lines) + "\n")
@@ -618,37 +676,57 @@ class Manager(tk.Tk):
             profile_id = profile.name
             if not messagebox.askyesno("Профиль", f"Использовать ID профиля '{profile_id}' из выбранной папки? Проверяется точный файл save\\coop_ckpt*.sav."):
                 return
-            logs = sorted(Path(tempfile.gettempdir()).glob("goh_coop_checkpoint_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
-            observed = self.collector.parse_log(logs[0]) if logs else {}
-            def known_or_ask(key: str, prompt: str):
+            log_path = self._role_log_path(role)
+            observed = self.collector.parse_log(log_path)
+            if observed["process_role"].value != role:
+                raise harness.HarnessError("Выбранный лог не подтверждает ожидаемую роль процесса")
+            protocol_path = filedialog.askopenfilename(title="Выберите ручной JSON протокол сопоставления checkpoint", filetypes=[("JSON", "*.json")])
+            if not protocol_path:
+                return
+            try:
+                protocol = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise harness.HarnessError(f"Не удалось прочитать протокол: {exc}") from exc
+            protocol_ok, protocol_issues = harness.validate_consistency_protocol(
+                protocol, list(manifest.get("expected_players", [])), str(manifest.get("mission_id")),
+                str(manifest.get("checkpoint_id")))
+            if not protocol_ok:
+                raise harness.HarnessError("Общая точка не подтверждена протоколом: " + "; ".join(protocol_issues))
+            def observed_value(key: str):
                 value = observed.get(key)
-                if value and value.status == runtime.OBSERVED and value.value not in (None, ""):
-                    return value.value
-                return self.ask_value("Требуется точное значение", prompt)
-            mission_path = known_or_ask("internal_mission_path", "Точный internal mission path из Coop Checkpoint log:")
-            archive_path = known_or_ask("virtual_archive_base_path", "Точный virtual archive base path из строки reload ARMED:")
-            mapping = known_or_ask("player_mapping", "Точный player mapping из Coop Checkpoint log отсутствует. Введите base,count (например 4,2):")
-            if isinstance(mapping, str):
-                try:
-                    base, count = (int(piece.strip()) for piece in mapping.split(",", 1))
-                    mapping = {"base": base, "count": count}
-                except (ValueError, TypeError):
-                    raise harness.HarnessError("Player mapping должен быть base,count числами из лога")
+                if not value or value.status != runtime.OBSERVED or value.value in (None, ""):
+                    raise harness.HarnessError(f"Preflight заблокирован: {key} отсутствует в выбранном {role} логе; значения не подставляются вручную")
+                return value.value
+            mission_path = observed_value("internal_mission_path")
+            archive_path = observed_value("virtual_archive_base_path")
+            mapping = observed_value("player_mapping")
             if not mission_path or not archive_path or not mapping:
                 return
             metadata = {"checkpoint_id": manifest.get("checkpoint_id"), "internal_mission_path": mission_path,
                 "archive_path": archive_path, "player_id": player, "game_build": manifest.get("game_build"),
                 "mission_id": manifest.get("mission_id"), "mod_fingerprint": manifest.get("mod_fingerprint"),
                 "is_host": self.session_role.get() == "HOST", "role": role, "player_mapping": mapping,
-                "profile_root": str(profile), "profile_id": profile_id}
+                "profile_root": str(profile), "profile_id": profile_id,
+                "process_role": role, "source_log_path": str(log_path),
+                "source_log_sha256": observed["source_log_sha256"].value,
+                "observed_log_fields": {name: observed[name].value for name in
+                    ("internal_mission_path", "virtual_archive_base_path", "quant_clock", "checkpoint_id")},
+                "consistency_protocol": protocol, "host_player_id": protocol.get("host_player_id")}
             resolution = ArchivePathResolver().resolve(archive_path, profile, profile_id, role)
             if resolution.status != "RESOLVED_LOCAL_FILE":
                 raise harness.HarnessError("UNVERIFIED_PATH: " + resolution.reason)
-            marker_dir = Path(tempfile.gettempdir())
-            if not messagebox.askyesno("TEMP marker", f"Будет создан одноразовый marker в стандартном TEMP:\n{marker_dir}\n\nTTL загрузчика — 15 минут. Продолжить?"):
+            marker_dir = log_path.parent.resolve()
+            log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime).astimezone().isoformat(timespec="seconds")
+            preview = (f"Роль процесса: {role}\nИсточник метаданных: {log_path}\n"
+                       f"Log modified: {log_mtime}; SHA-256: {observed['source_log_sha256'].value}\n"
+                       f"Архив checkpoint: {resolution.local_file}\nMarker: {marker_dir / (harness.SERVER_MARKER if role == 'server' else harness.CLIENT_MARKER)}\n"
+                       "Preflight: пройдены локальные проверки manifest/owner/size/SHA-256/profile/log/protocol. "
+                       "Локальные номера checkpoint не являются общим ID.\n\n"
+                       "Подтвердите, что TEMP/TMP этого процесса не изменились после создания лога. Для server process его каталог установлен по точному server log; если это не его фактический TEMP, отмените операцию.")
+            if not messagebox.askyesno("Preflight marker", preview):
                 return
             path = harness.prepare_marker(checkpoint, metadata, role, resolution.local_file, marker_dir, True)
-            messagebox.showwarning("Marker подготовлен — эксперимент", f"Файл записан:\n{path}\n\nЭто не подтверждает работу в игре. Сверьте полный путь, тип процесса, архив и оставшееся время TTL. Резервная копия автоматизирована только для уже существующего marker (здесь перезапись запрещена).")
+            messagebox.showwarning("Marker подготовлен — эксперимент", f"Роль: {role}\nИсточник: {log_path}\nАрхив: {resolution.local_file}\nMarker: {path}\nPreflight: PASS (локальные проверки)\n\nЭто не подтверждает синхронность или загрузку в игре. TEST-A/TEST-B остаются NOT_RUN.")
         except Exception as exc:
             messagebox.showerror("Подготовка остановлена", str(exc))
 

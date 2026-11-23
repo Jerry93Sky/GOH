@@ -20,6 +20,7 @@ from typing import Any
 
 import recovery_coordinator as coordinator
 from archive_path_resolver import ArchivePathResolver
+from coop_log_sources import classify_log_role, sha256_file
 
 MARKER_TTL_SECONDS = 15 * 60
 CLIENT_MARKER = "coop_checkpoint_reload_client.txt"
@@ -156,7 +157,76 @@ def inspect_peer_package(package: str | Path) -> tuple[dict[str, Any], list[str]
         return meta, issues
 
 
-def validate_peer_group(packages: list[str | Path], host_player_id: str) -> dict[str, Any]:
+def validate_consistency_protocol(protocol: dict[str, Any], expected_players: list[str],
+                                  mission_id: str, package_checkpoint_id: str | None = None) -> tuple[bool, list[str]]:
+    """Validate operator-recorded cross-peer checkpoint evidence, without claiming sync proof."""
+    issues: list[str] = []
+    if protocol.get("schema") != "goh-checkpoint-consistency-protocol-v1":
+        issues.append("unsupported or missing manual checkpoint protocol schema")
+    if not protocol.get("operator_confirmed_same_checkpoint_event"):
+        issues.append("operator has not recorded that peers observed the same checkpoint event")
+    if protocol.get("mission_id") != mission_id:
+        issues.append("manual protocol mission does not match recovery package")
+    checkpoint_id = protocol.get("checkpoint_id")
+    if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
+        issues.append("manual protocol has no operator-assigned shared checkpoint label")
+    if package_checkpoint_id is not None and protocol.get("package_checkpoint_id") != package_checkpoint_id:
+        issues.append("manual protocol package checkpoint reference does not match selected recovery files")
+    records = protocol.get("participants")
+    if not isinstance(records, list):
+        return False, issues + ["manual protocol participant sources are missing"]
+    seen: set[tuple[str, str]] = set()
+    mission_sources: set[str] = set()
+    for item in records:
+        if not isinstance(item, dict):
+            issues.append("manual protocol contains a malformed participant source")
+            continue
+        pid, role = item.get("participant_id"), item.get("process_role")
+        if pid not in expected_players or role not in {"client", "server"}:
+            issues.append(f"manual protocol contains an unknown participant/process role: {pid}/{role}")
+        key = (str(pid), str(role))
+        if key in seen:
+            issues.append(f"duplicate manual protocol source for {pid}/{role}")
+        seen.add(key)
+        path = item.get("source_log_path")
+        digest = item.get("source_log_sha256")
+        if not isinstance(path, str) or not path:
+            issues.append(f"manual protocol source log path is missing for {pid}/{role}")
+        elif classify_log_role(path) != role:
+            issues.append(f"manual protocol source log filename has the wrong process role for {pid}/{role}")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            issues.append(f"manual protocol source log SHA-256 is invalid for {pid}/{role}")
+        if not isinstance(item.get("quant_clock"), int):
+            issues.append(f"manual protocol quant clock is missing for {pid}/{role}")
+        if not isinstance(item.get("local_checkpoint_sequence"), int):
+            issues.append(f"manual protocol local checkpoint sequence is missing for {pid}/{role}")
+        if not item.get("internal_mission_path"):
+            issues.append(f"manual protocol mission source is missing for {pid}/{role}")
+        else:
+            mission_sources.add(str(item["internal_mission_path"]).casefold())
+        if not item.get("virtual_archive_base_path"):
+            issues.append(f"manual protocol archive source is missing for {pid}/{role}")
+    for player in expected_players:
+        if (player, "client") not in seen:
+            issues.append(f"manual protocol has no client log source for participant {player}")
+    host_id = protocol.get("host_player_id")
+    if host_id not in expected_players:
+        issues.append("manual protocol host player ID is outside the expected roster")
+    elif (host_id, "server") not in seen:
+        issues.append("manual protocol has no separate host server log source")
+    expected_sources = {(player, "client") for player in expected_players}
+    if host_id in expected_players:
+        expected_sources.add((host_id, "server"))
+    unexpected_sources = seen - expected_sources
+    if unexpected_sources:
+        issues.append("manual protocol contains process sources outside the client roster plus host server")
+    if len(mission_sources) > 1:
+        issues.append("manual protocol mission paths differ across participant process logs")
+    return not issues, issues
+
+
+def validate_peer_group(packages: list[str | Path], host_player_id: str,
+                        consistency_protocol: dict[str, Any] | None = None) -> dict[str, Any]:
     """Check separate participant ZIPs agree as a file set; this does not prove game synchronization."""
     issues: list[str] = []
     if len(packages) < 2:
@@ -193,12 +263,21 @@ def validate_peer_group(packages: list[str | Path], host_player_id: str) -> dict
     for record in records:
         if record.get("participant_id") != host_player_id and record.get("includes_host_server"):
             issues.append(f"server archive is present in non-host package {record.get('participant_id')}")
+    protocol_ok = False
+    protocol_issues = ["manual checkpoint consistency protocol not supplied"]
+    if consistency_protocol is not None and records:
+        protocol_ok, protocol_issues = validate_consistency_protocol(
+            consistency_protocol, list(reference.get("expected_players", [])), str(reference.get("mission_id")),
+            str(reference.get("checkpoint_id")))
     return {"status": "GROUP_FILE_SET_VERIFIED" if not issues else "INCOMPLETE_OR_MISMATCHED",
             "checkpoint_id": reference.get("checkpoint_id"), "mission_id": reference.get("mission_id"),
             "game_build": reference.get("game_build"), "mod_fingerprint": reference.get("mod_fingerprint"),
             "expected_players": reference.get("expected_players"), "participants": ids,
             "host_player_id": host_player_id, "issues": issues,
-            "game_restore_status": "NOT_VERIFIED_BY_FILE_SET"}
+            "game_restore_status": "NOT_VERIFIED_BY_FILE_SET",
+            "checkpoint_consistency_status": "OPERATOR_PROTOCOL_RECORDED_NOT_SYNCHRONIZATION_PROOF" if protocol_ok else "MISSING_OR_INCOMPLETE_MANUAL_PROTOCOL",
+            "checkpoint_consistency_issues": protocol_issues,
+            "automatic_marker_preparation": "ELIGIBLE_FOR_LOCAL_PREFLIGHT_ONLY" if protocol_ok and not issues else "BLOCKED"}
 
 
 def import_peer_package(package: str | Path, target_dir: str | Path,
@@ -325,15 +404,49 @@ def prepare_marker(checkpoint_dir: str | Path, package_metadata: dict[str, Any],
         raise HarnessError("Player ID is not in checkpoint roster")
     if manifest.get("participant_id") not in (None, player):
         raise HarnessError("Imported package is assigned to a different participant")
+    protocol = package_metadata.get("consistency_protocol")
+    if not isinstance(protocol, dict):
+        raise HarnessError("Shared checkpoint identity is not confirmed; supply the complete manual consistency protocol")
+    protocol_ok, protocol_issues = validate_consistency_protocol(
+        protocol, list(manifest.get("expected_players", [])), str(manifest.get("mission_id")),
+        str(manifest.get("checkpoint_id")))
+    if not protocol_ok:
+        raise HarnessError("Manual checkpoint protocol is incomplete: " + "; ".join(protocol_issues))
     archive = Path(local_archive).resolve(strict=True)
     expected_name = coordinator.SERVER_SAVE if role == "server" else coordinator.CLIENT_SAVE
     if archive.name.casefold() != expected_name.casefold():
         raise HarnessError(f"Expected local archive name {expected_name}")
     owner = "host_server" if role == "server" else f"participant:{player}"
-    role_record = next((f for f in manifest.get("files", []) if f.get("role") == role or f.get("owner") == owner), None)
-    if role_record:
-        if archive.stat().st_size != role_record.get("size_bytes") or _digest(archive) != role_record.get("sha256"):
-            raise HarnessError("Selected local archive does not match the checkpoint package")
+    records = manifest.get("files")
+    if not isinstance(records, list):
+        raise HarnessError("Checkpoint manifest has no file inventory")
+    if manifest.get("format") == PACKAGE_FORMAT:
+        if manifest.get("participant_id") != player:
+            raise HarnessError("Recovery package owner does not match the selected participant")
+        if role == "server" and not manifest.get("includes_host_server"):
+            raise HarnessError("Recovery package has no declared host server archive")
+        role_records = [f for f in records if isinstance(f, dict) and f.get("role") == role]
+        expected_rel = "archives/server.sav" if role == "server" else "archives/client.sav"
+        if any(f.get("path") != expected_rel for f in role_records):
+            raise HarnessError("Recovery package role points at an unexpected archive path")
+        expected_owner = "host_server" if role == "server" else f"participant:{player}"
+        if role_records and any(f.get("owner") not in (None, expected_owner) for f in role_records):
+            raise HarnessError("Recovery package archive owner does not match requested role and participant")
+    else:
+        role_records = [f for f in records if isinstance(f, dict) and f.get("owner") == owner]
+        expected_kind = "host_server" if role == "server" else "participant"
+        if role_records and any(f.get("kind") != expected_kind for f in role_records):
+            raise HarnessError("Checkpoint archive owner record has the wrong role kind")
+    if len(role_records) != 1:
+        raise HarnessError(f"Missing or duplicate required archive record for {owner}; marker preparation refused")
+    role_record = role_records[0]
+    expected_digest = role_record.get("sha256")
+    expected_size = role_record.get("size_bytes")
+    if (not isinstance(expected_size, int) or expected_size <= 0 or
+            not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_digest)):
+        raise HarnessError("Required archive manifest record has no valid size/SHA-256")
+    if archive.stat().st_size != expected_size or _digest(archive).casefold() != expected_digest.casefold():
+        raise HarnessError("Selected local archive size/SHA-256 differs from the required owner record")
     if role == "server" and not package_metadata.get("is_host"):
         raise HarnessError("Server marker can only be prepared on the host")
     mapping = package_metadata.get("player_mapping")
@@ -354,7 +467,42 @@ def prepare_marker(checkpoint_dir: str | Path, package_metadata: dict[str, Any],
         raise HarnessError("UNVERIFIED_PATH: " + resolution.reason)
     if resolution.local_file.stat().st_size != archive.stat().st_size or _digest(resolution.local_file) != _digest(archive):
         raise HarnessError("Resolved profile archive differs from the selected checkpoint archive")
-    path = Path(marker_dir).resolve() / (SERVER_MARKER if role == "server" else CLIENT_MARKER)
+    source_log_path = package_metadata.get("source_log_path")
+    source_log_sha256 = package_metadata.get("source_log_sha256")
+    if not source_log_path or not source_log_sha256:
+        raise HarnessError("Missing role-specific Coop Checkpoint log provenance; process TEMP cannot be established")
+    source_log = Path(source_log_path).resolve(strict=True)
+    if classify_log_role(source_log) != role:
+        raise HarnessError("Role-specific log filename does not match requested marker role")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", str(source_log_sha256)) or sha256_file(source_log).casefold() != str(source_log_sha256).casefold():
+        raise HarnessError("Role-specific log SHA-256 is missing or changed since preflight")
+    if package_metadata.get("process_role") != role:
+        raise HarnessError("Metadata process role does not match requested marker role")
+    protocol_player = package_metadata.get("host_player_id") if role == "server" else player
+    protocol_sources = [item for item in protocol.get("participants", []) if isinstance(item, dict)
+                        and item.get("participant_id") == protocol_player
+                        and item.get("process_role") == role]
+    if len(protocol_sources) != 1:
+        raise HarnessError("Manual protocol does not contain exactly one source for this participant process role")
+    source_record = protocol_sources[0]
+    if (Path(source_record.get("source_log_path", "")).resolve() != source_log
+            or source_record.get("source_log_sha256", "").casefold() != str(source_log_sha256).casefold()):
+        raise HarnessError("Selected role log differs from the source recorded in the manual checkpoint protocol")
+    observed_fields = package_metadata.get("observed_log_fields")
+    if not isinstance(observed_fields, dict):
+        raise HarnessError("Selected role log parsed fields are required for preflight")
+    for field_name, protocol_name in (("internal_mission_path", "internal_mission_path"),
+                                      ("virtual_archive_base_path", "virtual_archive_base_path"),
+                                      ("quant_clock", "quant_clock"),
+                                      ("checkpoint_id", "local_checkpoint_sequence")):
+        if observed_fields.get(field_name) != source_record.get(protocol_name):
+            raise HarnessError(f"Selected role log {field_name} differs from its manual protocol record")
+    if role == "server" and package_metadata.get("host_player_id") != player:
+        raise HarnessError("Server marker participant must match the recorded host player ID")
+    marker_root = Path(marker_dir).resolve()
+    if marker_root != source_log.parent.resolve():
+        raise HarnessError("Marker directory differs from the TEMP directory observed from this role's exact process log")
+    path = marker_root / (SERVER_MARKER if role == "server" else CLIENT_MARKER)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise HarnessError("A marker already exists; inspect and back it up before replacing")
@@ -380,25 +528,32 @@ def backup_marker(marker_path: str | Path, backup_dir: str | Path) -> Path:
     return target
 
 
-def read_coop_diagnostics(temp_dir: str | Path, max_lines: int = 100) -> list[str]:
-    """Read relevant Coop Checkpoint log lines and redact common profile path prefixes."""
+def read_coop_diagnostics(temp_dir: str | Path, max_lines: int = 100,
+                          role_logs: dict[str, str | Path] | None = None) -> list[str]:
+    """Read exact process-role logs separately; never choose a cross-role latest file."""
     root = Path(temp_dir)
-    logs = sorted(root.glob("goh_coop_checkpoint_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not logs:
-        return ["Coop Checkpoint log not found in TEMP"]
-    try:
-        lines = logs[0].read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as exc:
-        return [f"Could not read Coop Checkpoint log: {exc}"]
-    selected = [line for line in lines if re.search(r"error|warning|reload|checkpoint|marker", line, re.I)][-max_lines:]
-    if not selected:
-        return ["No checkpoint/reload/marker/error lines in latest log"]
     user_root = str(Path.home())
     safe = []
-    for line in selected:
-        line = re.sub(re.escape(user_root), "%USERPROFILE%", line, flags=re.I)
-        line = re.sub(r"(?i)[A-Z]:\\Users\\[^\\/]+", "%USERPROFILE%", line)
-        line = re.sub(r"(?i)(/profiles/)[^/\\]+", r"\1<redacted>", line)
-        line = re.sub(r"(?i)(\\profiles\\)[^/\\]+", r"\1<redacted>", line)
-        safe.append(line[:1000])
+    logs = (("client process", Path(role_logs["client"]) if role_logs and role_logs.get("client") else root / "goh_coop_checkpoint_call_to_arms.exe.log"),
+            ("server process", Path(role_logs["server"]) if role_logs and role_logs.get("server") else root / "goh_coop_checkpoint_call_to_arms_server.exe.log"))
+    for label, path in logs:
+        safe.append(f"[{label}] source={path}")
+        if not path.is_file():
+            safe.append("exact role log not found in selected directory")
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            safe.append(f"Could not read log: {exc}")
+            continue
+        selected = [line for line in lines if re.search(r"error|warning|reload|checkpoint|marker", line, re.I)][-max_lines:]
+        if not selected:
+            safe.append("No checkpoint/reload/marker/error lines")
+            continue
+        for line in selected:
+            line = re.sub(re.escape(user_root), "%USERPROFILE%", line, flags=re.I)
+            line = re.sub(r"(?i)[A-Z]:\\Users\\[^\\/]+", "%USERPROFILE%", line)
+            line = re.sub(r"(?i)(/profiles/)[^/\\]+", r"\1<redacted>", line)
+            line = re.sub(r"(?i)(\\profiles\\)[^\\/]+", r"\1<redacted>", line)
+            safe.append(line[:1000])
     return safe
