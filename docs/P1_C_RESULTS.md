@@ -24,7 +24,8 @@
 ## Проверки
 
 - `python -m unittest discover -s tools/tests -v` — 66 тестов PASS (синтетические тесты только локальной программы).
-- Финальный Windows 11 x64 EXE собран локально PyInstaller 6.16.0 / Python 3.14.3; `--smoke-test` завершился кодом 0. ZIP проверен: 14 записей, EXE 12,904,717 байт, внутренний SHA-256 совпал. Windows 10 отдельно не проверялась; CI Python 3.12 и GitHub Actions artifact ещё ожидаются.
+- Финальный Windows 11 x64 EXE локально собран PyInstaller 6.16.0 / Python 3.14.3; `--smoke-test` завершился кодом 0. Локальный ZIP проверен: 14 записей, EXE 12,904,717 байт, внутренний SHA-256 совпал.
+- GitHub Actions Windows x64 / Python 3.12: все шаги прошли SUCCESS — 66 тестов, standalone EXE, smoke-test, проверка ZIP/checksum и upload artifact. Windows 10 отдельно не запускалась.
 - Реальный GUI interaction, установленная игра и пара клиентов недоступны и не заявляются как протестированные.
 
 ## Блокеры и следующий этап
@@ -38,4 +39,4 @@
 
 ## Артефакты
 
-Локальные файлы: `out/v02-final/GOHRecoveryManager.exe` и `out/v02-final/GOH-Coop-Recovery-V0.2-FieldTest-win64.zip` (игнорируются Git). Workflow `windows-v0.2.yml` публикует Actions artifact после успешной CI сборки.
+Локальные файлы: `out/v02-final/GOHRecoveryManager.exe` и `out/v02-final/GOH-Coop-Recovery-V0.2-FieldTest-win64.zip` (игнорируются Git). CI artifact: `GOH-Coop-Recovery-V0.2-FieldTest-win64`, workflow [Windows V0.2 Field-Test Build](https://github.com/Jerry93Sky/GOH/actions/workflows/windows-v0.2.yml). ZIP digest от Actions upload: `sha256:9d00b422e6a71680ade0471b9795e94a560207e8d8378d8a52b415c0efd24578`.
