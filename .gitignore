@@ -1,6 +1,12 @@
 # Game installation, saves, profiles, and user evidence
 profiles/
 **/profiles/
+evidence/
+checkpoint-store/
+**/plans/
+**/results/
+**/.incomplete-*/
+**/.*.lock
 **/save/
 **/saves/
 **/Saved Games/
